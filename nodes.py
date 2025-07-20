@@ -158,15 +158,15 @@ class EquirectangularProcessor_Combined:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "yaw_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
-                "pitch_rotation": ("FLOAT", {"default": -65.0, "min": -90.0, "max": 90.0, "step": 0.1}),
-                "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
-                "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
-                "crop_to_180": ("BOOLEAN", {"default": False}),
-                "crop_to_square": ("BOOLEAN", {"default": False}),
-                "output_width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1}),
-                "output_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 1}),
-                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
+                "yaw_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1, "forceInput": True}),
+                "pitch_rotation": ("FLOAT", {"default": -65.0, "min": -90.0, "max": 90.0, "step": 0.1, "forceInput": True}),
+                "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1, "forceInput": True}),
+                "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1, "forceInput": True}),
+                "crop_to_180": ("BOOLEAN", {"default": False, "forceInput": True}),
+                "crop_to_square": ("BOOLEAN", {"default": False, "forceInput": True}),
+                "output_width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1, "forceInput": True}),
+                "output_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 1, "forceInput": True}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "forceInput": True}),
             }
         }
     
