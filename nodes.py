@@ -211,8 +211,8 @@ class EquirectangularProcessor_Combined:
                 horizon_offset=horizon_offset,
                 crop_to_180=crop_to_180,
                 crop_to_square=crop_to_square,
-                output_width=output_width if crop_to_180 else None,
-                output_height=output_height if crop_to_180 else None,
+                output_width=output_width if crop_to_180 else 1024,
+                output_height=output_height if crop_to_180 else 512,
                 interpolation=interpolation
             )
             
