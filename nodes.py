@@ -158,8 +158,6 @@ class EquirectangularProcessor_Combined:
         return {
             "required": {
                 "image": ("IMAGE",),
-            },
-            "optional": {
                 "yaw_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
                 "pitch_rotation": ("FLOAT", {"default": -65.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
@@ -179,35 +177,15 @@ class EquirectangularProcessor_Combined:
     
     def process_equirectangular(self,
                               image: torch.Tensor,
-                              yaw_rotation: float = 0.0,
-                              pitch_rotation: float = -65.0,
-                              roll_rotation: float = 0.0,
-                              horizon_offset: float = 0.0,
-                              crop_to_180: bool = False,
-                              crop_to_square: bool = False,
-                              output_width = 1024,
-                              output_height = 512,
-                              interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
-        
-        # Handle None values for optional parameters
-        if output_width is None:
-            output_width = 1024
-        if output_height is None:
-            output_height = 512
-        if yaw_rotation is None:
-            yaw_rotation = 0.0
-        if pitch_rotation is None:
-            pitch_rotation = -65.0
-        if roll_rotation is None:
-            roll_rotation = 0.0
-        if horizon_offset is None:
-            horizon_offset = 0.0
-        if crop_to_180 is None:
-            crop_to_180 = False
-        if crop_to_square is None:
-            crop_to_square = False
-        if interpolation is None:
-            interpolation = "lanczos"
+                              yaw_rotation: float,
+                              pitch_rotation: float,
+                              roll_rotation: float,
+                              horizon_offset: float,
+                              crop_to_180: bool,
+                              crop_to_square: bool,
+                              output_width: int,
+                              output_height: int,
+                              interpolation: str) -> Tuple[torch.Tensor]:
         
         batch_size = image.shape[0]
         processed_images = []
