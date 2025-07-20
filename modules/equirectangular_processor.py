@@ -158,7 +158,8 @@ class EquirectangularProcessor:
         
         # Resize if output dimensions specified
         if output_width is not None and output_height is not None:
-            if len(image.shape) == 3:
+            # Handle float32 images properly
+            if image.dtype == np.float32:
                 cropped = cv2.resize(cropped, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
             else:
                 cropped = cv2.resize(cropped, (output_width, output_height), interpolation=cv2.INTER_CUBIC)

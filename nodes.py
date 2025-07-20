@@ -53,9 +53,9 @@ class EquirectangularRotate:
             img_tensor = image[i]  # (H, W, C)
             img_numpy = img_tensor.cpu().numpy()
             
-            # Convert from [0,1] float to [0,255] uint8 for processing
-            if img_numpy.dtype == np.float32 or img_numpy.dtype == np.float64:
-                img_numpy = (img_numpy * 255).astype(np.uint8)
+            # Keep float32 for processing to avoid value clipping
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
             
             # Process the image
             processed_img = EquirectangularProcessor.rotate_equirectangular(
@@ -66,9 +66,8 @@ class EquirectangularRotate:
                 horizon_offset=horizon_offset
             )
             
-            # Convert back to [0,1] float and tensor
-            if processed_img.dtype == np.uint8:
-                processed_img = processed_img.astype(np.float32) / 255.0
+            # Ensure output is float32 in [0,1] range
+            processed_img = np.clip(processed_img, 0.0, 1.0).astype(np.float32)
             
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
@@ -116,9 +115,9 @@ class EquirectangularCrop180:
             img_tensor = image[i]
             img_numpy = img_tensor.cpu().numpy()
             
-            # Convert to uint8 for processing
-            if img_numpy.dtype == np.float32 or img_numpy.dtype == np.float64:
-                img_numpy = (img_numpy * 255).astype(np.uint8)
+            # Keep float32 for processing
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
             
             # Determine output dimensions
             if maintain_aspect:
@@ -133,9 +132,8 @@ class EquirectangularCrop180:
                 output_height=output_height
             )
             
-            # Convert back to tensor
-            if cropped_img.dtype == np.uint8:
-                cropped_img = cropped_img.astype(np.float32) / 255.0
+            # Ensure output is float32 in [0,1] range
+            cropped_img = np.clip(cropped_img, 0.0, 1.0).astype(np.float32)
             
             cropped_tensor = torch.from_numpy(cropped_img)
             processed_images.append(cropped_tensor)
@@ -190,9 +188,9 @@ class EquirectangularProcessor_Combined:
             img_tensor = image[i]
             img_numpy = img_tensor.cpu().numpy()
             
-            # Convert to uint8 for processing
-            if img_numpy.dtype == np.float32 or img_numpy.dtype == np.float64:
-                img_numpy = (img_numpy * 255).astype(np.uint8)
+            # Keep float32 for processing
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
             
             # Process the image with all operations
             processed_img = EquirectangularProcessor.process_equirectangular(
@@ -206,9 +204,8 @@ class EquirectangularProcessor_Combined:
                 output_height=output_height if crop_to_180 else None
             )
             
-            # Convert back to tensor
-            if processed_img.dtype == np.uint8:
-                processed_img = processed_img.astype(np.float32) / 255.0
+            # Ensure output is float32 in [0,1] range
+            processed_img = np.clip(processed_img, 0.0, 1.0).astype(np.float32)
             
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
