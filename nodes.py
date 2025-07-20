@@ -185,9 +185,29 @@ class EquirectangularProcessor_Combined:
                               horizon_offset: float = 0.0,
                               crop_to_180: bool = False,
                               crop_to_square: bool = False,
-                              output_width: int = 1024,
-                              output_height: int = 512,
+                              output_width = 1024,
+                              output_height = 512,
                               interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        
+        # Handle None values for optional parameters
+        if output_width is None:
+            output_width = 1024
+        if output_height is None:
+            output_height = 512
+        if yaw_rotation is None:
+            yaw_rotation = 0.0
+        if pitch_rotation is None:
+            pitch_rotation = -65.0
+        if roll_rotation is None:
+            roll_rotation = 0.0
+        if horizon_offset is None:
+            horizon_offset = 0.0
+        if crop_to_180 is None:
+            crop_to_180 = False
+        if crop_to_square is None:
+            crop_to_square = False
+        if interpolation is None:
+            interpolation = "lanczos"
         
         batch_size = image.shape[0]
         processed_images = []
