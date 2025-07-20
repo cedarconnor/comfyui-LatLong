@@ -23,7 +23,7 @@ class EquirectangularRotate:
             },
             "optional": {
                 "yaw_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
-                "pitch_rotation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
+                "pitch_rotation": ("FLOAT", {"default": -65.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
                 "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
@@ -38,7 +38,7 @@ class EquirectangularRotate:
     def rotate_equirectangular(self,
                              image: torch.Tensor,
                              yaw_rotation: float = 0.0,
-                             pitch_rotation: float = 0.0,
+                             pitch_rotation: float = -65.0,
                              roll_rotation: float = 0.0,
                              horizon_offset: float = 0.0,
                              interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
@@ -161,10 +161,11 @@ class EquirectangularProcessor_Combined:
             },
             "optional": {
                 "yaw_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
-                "pitch_rotation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
+                "pitch_rotation": ("FLOAT", {"default": -65.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
                 "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "crop_to_180": ("BOOLEAN", {"default": False}),
+                "crop_to_square": ("BOOLEAN", {"default": False}),
                 "output_width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1}),
                 "output_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 1}),
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
@@ -179,10 +180,11 @@ class EquirectangularProcessor_Combined:
     def process_equirectangular(self,
                               image: torch.Tensor,
                               yaw_rotation: float = 0.0,
-                              pitch_rotation: float = 0.0,
+                              pitch_rotation: float = -65.0,
                               roll_rotation: float = 0.0,
                               horizon_offset: float = 0.0,
                               crop_to_180: bool = False,
+                              crop_to_square: bool = False,
                               output_width: int = 1024,
                               output_height: int = 512,
                               interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
@@ -208,6 +210,7 @@ class EquirectangularProcessor_Combined:
                 roll=roll_rotation,
                 horizon_offset=horizon_offset,
                 crop_to_180=crop_to_180,
+                crop_to_square=crop_to_square,
                 output_width=output_width if crop_to_180 else None,
                 output_height=output_height if crop_to_180 else None,
                 interpolation=interpolation
@@ -218,6 +221,60 @@ class EquirectangularProcessor_Combined:
             
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
+            
+            pbar.update(i + 1)
+        
+        result = torch.stack(processed_images, dim=0)
+        return (result,)
+
+
+class EquirectangularCropSquare:
+    """ComfyUI node for cropping equirectangular images to square (width = height)"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("square_image",)
+    FUNCTION = "crop_to_square"
+    CATEGORY = "LatLong"
+    
+    def crop_to_square(self,
+                      image: torch.Tensor,
+                      interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        
+        batch_size = image.shape[0]
+        processed_images = []
+        
+        pbar = ProgressBar(batch_size)
+        
+        for i in range(batch_size):
+            img_tensor = image[i]
+            img_numpy = img_tensor.cpu().numpy()
+            
+            # Keep float32 for processing
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+            
+            # Crop the image to square
+            cropped_img = EquirectangularProcessor.crop_to_square(
+                img_numpy,
+                interpolation=interpolation
+            )
+            
+            # Ensure output is float32 in [0,1] range
+            cropped_img = np.clip(cropped_img, 0.0, 1.0).astype(np.float32)
+            
+            cropped_tensor = torch.from_numpy(cropped_img)
+            processed_images.append(cropped_tensor)
             
             pbar.update(i + 1)
         

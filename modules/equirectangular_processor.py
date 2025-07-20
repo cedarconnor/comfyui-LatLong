@@ -183,6 +183,25 @@ class EquirectangularProcessor:
         
         return cropped
     
+    @staticmethod
+    def crop_to_square(image: np.ndarray, interpolation: str = 'lanczos') -> np.ndarray:
+        """Crop equirectangular image to square (width = height of original image)"""
+        height, width = image.shape[:2]
+        
+        # Calculate crop boundaries to get a square with width = original height
+        crop_width = height
+        start_x = (width - crop_width) // 2  # Center the crop
+        end_x = start_x + crop_width
+        
+        # Ensure we don't exceed image boundaries
+        start_x = max(0, start_x)
+        end_x = min(width, end_x)
+        
+        # Crop the image to square
+        cropped = image[:, start_x:end_x]
+        
+        return cropped
+    
     @classmethod
     def process_equirectangular(cls, 
                               image: np.ndarray,
@@ -191,6 +210,7 @@ class EquirectangularProcessor:
                               roll: float = 0,
                               horizon_offset: float = 0,
                               crop_to_180: bool = False,
+                              crop_to_square: bool = False,
                               output_width: Optional[int] = None,
                               output_height: Optional[int] = None,
                               interpolation: str = 'lanczos') -> np.ndarray:
@@ -202,8 +222,10 @@ class EquirectangularProcessor:
         else:
             processed_image = image.copy()
         
-        # Apply 180-degree cropping if requested
-        if crop_to_180:
+        # Apply cropping if requested (square takes precedence over 180)
+        if crop_to_square:
+            processed_image = cls.crop_to_square(processed_image, interpolation)
+        elif crop_to_180:
             processed_image = cls.crop_to_180(processed_image, output_width, output_height, interpolation)
         
         return processed_image
