@@ -26,6 +26,7 @@ class EquirectangularRotate:
                 "pitch_rotation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
                 "roll_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1}),
                 "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
             }
         }
     
@@ -39,7 +40,8 @@ class EquirectangularRotate:
                              yaw_rotation: float = 0.0,
                              pitch_rotation: float = 0.0,
                              roll_rotation: float = 0.0,
-                             horizon_offset: float = 0.0) -> Tuple[torch.Tensor]:
+                             horizon_offset: float = 0.0,
+                             interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
         
         # Convert ComfyUI tensor format (B, H, W, C) to numpy
         batch_size = image.shape[0]
@@ -63,7 +65,8 @@ class EquirectangularRotate:
                 yaw=yaw_rotation,
                 pitch=pitch_rotation,
                 roll=roll_rotation,
-                horizon_offset=horizon_offset
+                horizon_offset=horizon_offset,
+                interpolation=interpolation
             )
             
             # Ensure output is float32 in [0,1] range
@@ -92,6 +95,7 @@ class EquirectangularCrop180:
                 "output_width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1}),
                 "output_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 1}),
                 "maintain_aspect": ("BOOLEAN", {"default": True}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
             }
         }
     
@@ -104,7 +108,8 @@ class EquirectangularCrop180:
                    image: torch.Tensor,
                    output_width: int = 1024,
                    output_height: int = 512,
-                   maintain_aspect: bool = True) -> Tuple[torch.Tensor]:
+                   maintain_aspect: bool = True,
+                   interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
         
         batch_size = image.shape[0]
         processed_images = []
@@ -129,7 +134,8 @@ class EquirectangularCrop180:
             cropped_img = EquirectangularProcessor.crop_to_180(
                 img_numpy,
                 output_width=output_width,
-                output_height=output_height
+                output_height=output_height,
+                interpolation=interpolation
             )
             
             # Ensure output is float32 in [0,1] range
@@ -161,6 +167,7 @@ class EquirectangularProcessor_Combined:
                 "crop_to_180": ("BOOLEAN", {"default": False}),
                 "output_width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1}),
                 "output_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 1}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
             }
         }
     
@@ -177,7 +184,8 @@ class EquirectangularProcessor_Combined:
                               horizon_offset: float = 0.0,
                               crop_to_180: bool = False,
                               output_width: int = 1024,
-                              output_height: int = 512) -> Tuple[torch.Tensor]:
+                              output_height: int = 512,
+                              interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
         
         batch_size = image.shape[0]
         processed_images = []
@@ -201,7 +209,8 @@ class EquirectangularProcessor_Combined:
                 horizon_offset=horizon_offset,
                 crop_to_180=crop_to_180,
                 output_width=output_width if crop_to_180 else None,
-                output_height=output_height if crop_to_180 else None
+                output_height=output_height if crop_to_180 else None,
+                interpolation=interpolation
             )
             
             # Ensure output is float32 in [0,1] range

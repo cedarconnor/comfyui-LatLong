@@ -3,6 +3,7 @@ import torch
 import cv2
 from typing import Tuple, Optional
 from scipy.spatial.transform import Rotation
+from scipy.ndimage import map_coordinates
 
 
 class EquirectangularProcessor:
@@ -68,48 +69,56 @@ class EquirectangularProcessor:
         return rotated_points[..., 0], rotated_points[..., 1], rotated_points[..., 2]
     
     @staticmethod
-    def bilinear_interpolate(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        """Perform bilinear interpolation on image at given coordinates"""
+    def interpolate_image(image: np.ndarray, x: np.ndarray, y: np.ndarray, method: str = 'lanczos') -> np.ndarray:
+        """Perform high-quality interpolation on image at given coordinates"""
         height, width = image.shape[:2]
+        
+        # Handle different interpolation methods
+        if method == 'nearest':
+            order = 0
+        elif method == 'bilinear':
+            order = 1
+        elif method == 'bicubic':
+            order = 3
+        elif method == 'lanczos':
+            # Use scipy's map_coordinates with spline interpolation for high quality
+            order = 3
+        else:
+            order = 3  # Default to bicubic
         
         # Clamp coordinates to valid range
         x = np.clip(x, 0, width - 1)
         y = np.clip(y, 0, height - 1)
         
-        x0 = np.floor(x).astype(int)
-        x1 = np.minimum(x0 + 1, width - 1)
-        y0 = np.floor(y).astype(int)
-        y1 = np.minimum(y0 + 1, height - 1)
-        
-        # Get fractional parts
-        dx = x - x0
-        dy = y - y0
-        
-        # Get pixel values at corners
         if len(image.shape) == 3:  # Color image
-            I00 = image[y0, x0]
-            I01 = image[y1, x0]
-            I10 = image[y0, x1]
-            I11 = image[y1, x1]
-            
-            # Expand dimensions for broadcasting
-            dx = dx[..., np.newaxis]
-            dy = dy[..., np.newaxis]
+            # Process each channel separately
+            interpolated = np.zeros_like(image)
+            for c in range(image.shape[2]):
+                interpolated[..., c] = map_coordinates(
+                    image[..., c], 
+                    [y, x], 
+                    order=order, 
+                    mode='wrap',  # Wrap for equirectangular longitude wrapping
+                    prefilter=True
+                )
         else:  # Grayscale image
-            I00 = image[y0, x0]
-            I01 = image[y1, x0]
-            I10 = image[y0, x1]
-            I11 = image[y1, x1]
-        
-        # Bilinear interpolation
-        I0 = I00 * (1 - dx) + I10 * dx
-        I1 = I01 * (1 - dx) + I11 * dx
-        interpolated = I0 * (1 - dy) + I1 * dy
+            interpolated = map_coordinates(
+                image, 
+                [y, x], 
+                order=order, 
+                mode='wrap',
+                prefilter=True
+            )
         
         return interpolated
     
+    @staticmethod
+    def bilinear_interpolate(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Legacy bilinear interpolation method - kept for compatibility"""
+        return EquirectangularProcessor.interpolate_image(image, x, y, method='bilinear')
+    
     @classmethod
-    def rotate_equirectangular(cls, image: np.ndarray, yaw: float = 0, pitch: float = 0, roll: float = 0, horizon_offset: float = 0) -> np.ndarray:
+    def rotate_equirectangular(cls, image: np.ndarray, yaw: float = 0, pitch: float = 0, roll: float = 0, horizon_offset: float = 0, interpolation: str = 'lanczos') -> np.ndarray:
         """Rotate an equirectangular image with optional horizon adjustment"""
         height, width = image.shape[:2]
         
@@ -139,13 +148,13 @@ class EquirectangularProcessor:
         # Handle longitude wrapping
         x_new = np.mod(x_new, width)
         
-        # Interpolate to get final image
-        rotated_image = cls.bilinear_interpolate(image, x_new, y_new)
+        # Interpolate to get final image with specified method
+        rotated_image = cls.interpolate_image(image, x_new, y_new, method=interpolation)
         
         return rotated_image
     
     @staticmethod
-    def crop_to_180(image: np.ndarray, output_width: Optional[int] = None, output_height: Optional[int] = None) -> np.ndarray:
+    def crop_to_180(image: np.ndarray, output_width: Optional[int] = None, output_height: Optional[int] = None, interpolation: str = 'lanczos') -> np.ndarray:
         """Crop equirectangular image to 180 degree field of view"""
         height, width = image.shape[:2]
         
@@ -156,13 +165,21 @@ class EquirectangularProcessor:
         # Crop the image
         cropped = image[:, start_x:end_x]
         
-        # Resize if output dimensions specified
+        # Resize if output dimensions specified with high-quality interpolation
         if output_width is not None and output_height is not None:
-            # Handle float32 images properly
-            if image.dtype == np.float32:
-                cropped = cv2.resize(cropped, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+            # Map interpolation methods to OpenCV constants
+            if interpolation == 'nearest':
+                cv_interp = cv2.INTER_NEAREST
+            elif interpolation == 'bilinear':
+                cv_interp = cv2.INTER_LINEAR
+            elif interpolation == 'bicubic':
+                cv_interp = cv2.INTER_CUBIC
+            elif interpolation == 'lanczos':
+                cv_interp = cv2.INTER_LANCZOS4
             else:
-                cropped = cv2.resize(cropped, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+                cv_interp = cv2.INTER_LANCZOS4  # Default to highest quality
+            
+            cropped = cv2.resize(cropped, (output_width, output_height), interpolation=cv_interp)
         
         return cropped
     
@@ -175,17 +192,18 @@ class EquirectangularProcessor:
                               horizon_offset: float = 0,
                               crop_to_180: bool = False,
                               output_width: Optional[int] = None,
-                              output_height: Optional[int] = None) -> np.ndarray:
+                              output_height: Optional[int] = None,
+                              interpolation: str = 'lanczos') -> np.ndarray:
         """Main processing function that combines all operations"""
         
         # Apply rotation and horizon adjustment
         if yaw != 0 or pitch != 0 or roll != 0 or horizon_offset != 0:
-            processed_image = cls.rotate_equirectangular(image, yaw, pitch, roll, horizon_offset)
+            processed_image = cls.rotate_equirectangular(image, yaw, pitch, roll, horizon_offset, interpolation)
         else:
             processed_image = image.copy()
         
         # Apply 180-degree cropping if requested
         if crop_to_180:
-            processed_image = cls.crop_to_180(processed_image, output_width, output_height)
+            processed_image = cls.crop_to_180(processed_image, output_width, output_height, interpolation)
         
         return processed_image
