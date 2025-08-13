@@ -1,183 +1,123 @@
-# ComfyUI LatLong - Equirectangular Image Processing Nodes
+# ComfyUI LatLong — Equirectangular Image Nodes
 
-Advanced equirectangular (360°) image processing nodes for ComfyUI, enabling precise rotation, horizon adjustment, and specialized cropping operations for panoramic images.
+High‑quality equirectangular (360°) image processing nodes for ComfyUI. Rotate with yaw/pitch/roll, adjust the horizon, crop to 180° or square, convert to cubemaps, and extract perspective views — all designed for panoramic workflows.
 
-## 🌟 Features
+## What’s New
 
-### 🔄 **3D Rotation Control**
-- **Yaw Rotation**: -180° to +180° (horizontal rotation)
-- **Pitch Rotation**: -90° to +90° (vertical tilt, defaults to -65°)
-- **Roll Rotation**: -180° to +180° (banking/roll)
-- **Horizon Offset**: -90° to +90° (vertical horizon adjustment)
+- All‑in‑One node now embeds controls directly in the node (sliders/toggles/dropdowns). No external parameter nodes are required for rotation/crop/interpolation.
+- Helpful tooltips added to every node and parameter to clarify behavior and best‑use guidance.
 
-### ✂️ **Specialized Cropping**
-- **180° Longitude Crop**: Extract center 180° from full 360° panorama
-- **Square Crop**: Crop width to match original image height (perfect for square outputs)
-- **Custom Dimensions**: Configurable output width and height for 180° crops
+## Installation
 
-### 🎨 **High-Quality Filtering**
-- **Lanczos** (default): Highest quality, best for photographic content
-- **Bicubic**: High quality, good balance of speed and quality
-- **Bilinear**: Medium quality, faster processing
-- **Nearest**: Lowest quality, fastest processing
+Option A — Clone (recommended)
+- From `ComfyUI/custom_nodes`:
+  - `git clone https://github.com/cedarconnor/comfyui-LatLong.git`
+  - `cd comfyui-LatLong`
+  - `pip install -r requirements.txt`
+  - Restart ComfyUI
 
-### ⚡ **Performance Features**
-- **Batch Processing**: Handle multiple images simultaneously
-- **Progress Indicators**: Real-time processing feedback
-- **Float32 Pipeline**: Maintains image quality throughout processing
-- **Memory Efficient**: Optimized for large panoramic images
+Option B — Manual
+- Extract the repo into `ComfyUI/custom_nodes/comfyui-LatLong/`
+- Install deps: `pip install numpy>=1.21.0 opencv-python>=4.5.0 scipy>=1.7.0 torch>=1.9.0`
+- Restart ComfyUI
 
-## 📦 Nodes Included
+Requirements
+- ComfyUI (latest), Python 3.8+
+- Python packages:
+  - numpy>=1.21.0, opencv-python>=4.5.0, scipy>=1.7.0, torch>=1.9.0
 
-### 1. **Equirectangular Rotate**
-Dedicated node for rotation and horizon adjustments only.
-- All 3D rotation controls (yaw, pitch, roll)
-- Horizon offset adjustment
-- Interpolation quality selection
+GPU Notes
+- Some GPU paths use `torch.grid_sample` and support bilinear/nearest only. Lanczos/Bicubic use CPU (OpenCV) paths.
 
-### 2. **Equirectangular Crop 180**
-Specialized node for 180-degree longitude cropping.
-- Center 180° extraction from 360° panoramas
-- Custom output dimensions
-- Aspect ratio maintenance option
-- High-quality resize with selectable interpolation
+## Nodes Overview
 
-### 3. **Equirectangular Crop Square**
-Creates perfect square crops from equirectangular images.
-- Width automatically set to original image height
-- Ideal for social media and square displays
-- Center-aligned cropping
+1) Equirectangular Rotate
+- Purpose: Rotate an equirectangular image with yaw/pitch/roll and adjust the horizon.
+- Inputs:
+  - `image`: equirectangular tensor (B,H,W,C) in [0,1]
+  - `yaw_rotation`: horizontal rotation (degrees)
+  - `pitch_rotation`: vertical tilt (degrees)
+  - `roll_rotation`: bank rotation (degrees)
+  - `horizon_offset`: vertical horizon shift (degrees)
+  - `interpolation`: lanczos | bicubic | bilinear | nearest
+  - `backend`: auto | cpu | gpu
 
-### 4. **Equirectangular Processor (All-in-One)**
-Complete processing node combining all features.
-- All rotation controls
-- Both cropping options (square takes precedence)
-- Full interpolation control
-- Single-node workflow solution
+2) Equirectangular Crop 180
+- Purpose: Extract a horizontal FOV (default 180°) window from an equirectangular image.
+- Inputs:
+  - `image`
+  - `output_width`, `output_height`: target size
+  - `maintain_aspect`: preserve natural aspect ratio for selected FOV
+  - `center_longitude_deg`: FOV center longitude (degrees)
+  - `fov_degrees`: horizontal field of view (degrees)
+  - `interpolation`
 
-## 🚀 Installation
+3) Equirectangular Crop Square
+- Purpose: Center‑crop width to match the original height (perfect square).
+- Inputs: `image`, `interpolation` (not used by pure crop; kept for consistency)
 
-### Method 1: Clone Repository
-1. Navigate to your ComfyUI custom nodes directory:
-   ```bash
-   cd ComfyUI/custom_nodes/
-   ```
+4) Equirectangular Processor (All‑in‑One)
+- Purpose: Rotate then optionally crop to 180° or to a centered square — a single‑node workflow. Note: square crop takes precedence over 180°.
+- Inputs:
+  - `image`
+  - `yaw_rotation`, `pitch_rotation`, `roll_rotation`, `horizon_offset`
+  - `crop_to_180`, `crop_to_square`
+  - `output_width`, `output_height` (for 180° crop)
+  - `interpolation`
 
-2. Clone this repository:
-   ```bash
-   git clone https://github.com/cedarconnor/comfyui-LatLong.git
-   ```
+5) Equirectangular Perspective Extract
+- Purpose: Extract a pinhole‑camera perspective view (yaw/pitch/roll/FOV) from an equirectangular panorama.
+- Inputs: `image`, `yaw_rotation`, `pitch_rotation`, `roll_rotation`, `fov_degrees`, `output_width`, `output_height`, `interpolation`, `backend`
 
-3. Install dependencies:
-   ```bash
-   cd comfyui-LatLong
-   pip install -r requirements.txt
-   ```
+6) Equirectangular → Cubemap (3×2)
+- Purpose: Convert equirectangular panorama to a 3×2 cubemap atlas.
+- Inputs: `image`, `face_size`, `layout` (3×2), `interpolation`
+- Face order: [left, front, right] on top row; [back, top, bottom] on bottom row
 
-4. Restart ComfyUI
+## Quickstart Examples
 
-### Method 2: Manual Installation
-1. Download and extract this repository to `ComfyUI/custom_nodes/comfyui-LatLong/`
-2. Install the required dependencies:
-   ```bash
-   pip install numpy>=1.21.0 opencv-python>=4.5.0 scipy>=1.7.0 torch>=1.9.0
-   ```
-3. Restart ComfyUI
+Rotate
+- Add Equirectangular Rotate, connect an image, tweak yaw/pitch/roll/horizon.
 
-## 📋 Requirements
+Square Crop
+- Add Equirectangular Crop Square to center‑crop to a perfect square.
 
-- **ComfyUI**: Latest version
-- **Python**: 3.8+
-- **Dependencies**:
-  - `numpy>=1.21.0`
-  - `opencv-python>=4.5.0` 
-  - `scipy>=1.7.0`
-  - `torch>=1.9.0`
+180° Extraction
+- Add Equirectangular Crop 180, set `center_longitude_deg` and `fov_degrees` as needed, enable Maintain Aspect for correct proportions.
 
-## 🎯 Usage Examples
+Perspective View
+- Add Equirectangular Perspective Extract, set yaw/pitch/roll, FOV, and output size.
 
-### Basic Rotation
-1. Add **Equirectangular Rotate** node
-2. Connect your equirectangular image input
-3. Adjust rotation parameters:
-   - Yaw: Rotate left/right
-   - Pitch: Tilt up/down (defaults to -65°)
-   - Roll: Banking rotation
-   - Horizon Offset: Vertical horizon adjustment
+Cubemap
+- Add Equirectangular → Cubemap (3×2), choose `face_size`, select interpolation.
 
-### Square Crop for Social Media
-1. Add **Equirectangular Crop Square** node
-2. Connect your panoramic image
-3. Get a perfect square crop at original height resolution
+All‑in‑One
+- Add Equirectangular Processor (All‑in‑One), adjust rotation; enable square or 180° crop; pick interpolation. All controls are embedded in the node.
 
-### 180° View Extraction
-1. Add **Equirectangular Crop 180** node
-2. Set desired output dimensions
-3. Extract center 180° field of view with high-quality resizing
+## Technical Notes
 
-### Complete Processing Pipeline
-1. Add **Equirectangular Processor** node
-2. Configure rotation (pitch defaults to -65°)
-3. Enable square crop or 180° crop as needed
-4. Select interpolation quality (Lanczos recommended)
+Coordinate System
+- Accurate spherical transforms with longitude wrapping and pole handling.
 
-## ⚙️ Technical Details
+Interpolation
+- CPU: OpenCV remap (Lanczos, Bicubic, Bilinear, Nearest)
+- GPU: torch.grid_sample (Bilinear/Nearest where applicable)
 
-### Coordinate System
-- Uses standard spherical coordinate transformations
-- Proper handling of equirectangular projection mathematics
-- Robust pole singularity handling
+Pipeline
+- Input (B,H,W,C) → float32 processing → transform → resample → output tensor in [0,1].
 
-### Interpolation Methods
-- **Lanczos**: Uses OpenCV LANCZOS4 and scipy spline interpolation
-- **Bicubic**: Third-order polynomial interpolation
-- **Bilinear**: Linear interpolation between pixels
-- **Nearest**: Closest pixel sampling
+## Troubleshooting
 
-### Image Processing Pipeline
-1. **Input**: ComfyUI tensor format (B, H, W, C)
-2. **Conversion**: Float32 processing to maintain quality
-3. **Transformation**: 3D rotation matrix applications
-4. **Interpolation**: High-quality resampling
-5. **Output**: Properly formatted ComfyUI tensors
+- Blurry output: prefer Lanczos/Bicubic for final renders.
+- Memory limits: reduce resolution or batch size.
+- GPU path missing filters: use CPU for Lanczos/Bicubic.
 
-## 🔧 Advanced Features
+## Contributing
 
-### Longitude Wrapping
-Proper handling of longitude boundaries for seamless 360° rotations.
+Issues, feature requests, and PRs are welcome.
 
-### Batch Processing
-Efficiently process multiple images with progress tracking.
+## License
 
-### Memory Optimization
-Designed to handle large panoramic images without excessive memory usage.
+Open source — see the repository license.
 
-## 🐛 Troubleshooting
-
-### Common Issues
-- **"NoneType validation error"**: Fixed in latest version - restart ComfyUI
-- **Memory errors**: Reduce image size or process fewer images in batch
-- **Blurry output**: Use Lanczos or Bicubic interpolation for better quality
-
-### Performance Tips
-- Use Lanczos for final output quality
-- Use Bilinear for faster preview/testing
-- Process smaller batches for large images
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
-
-## 📄 License
-
-This project is open source. Please check the license file for details.
-
-## 🙏 Acknowledgments
-
-- Built for the ComfyUI ecosystem
-- Uses scipy for robust mathematical transformations
-- OpenCV for high-quality image processing
-
----
-
-**Perfect for**: 360° photography, VR content creation, panoramic image processing, social media content, architectural visualization, and any workflow requiring precise equirectangular image manipulation.
+— Ideal for 360° photography, VR, panoramic pipelines, and social content where precise equirectangular control matters.
