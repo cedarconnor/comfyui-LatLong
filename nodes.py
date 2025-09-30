@@ -442,3 +442,326 @@ class EquirectangularToCubemap:
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
+
+
+class CubemapToEquirectangular:
+    """ComfyUI node to convert a 3x2 cubemap atlas back to equirectangular format."""
+    DESCRIPTION = "Convert a 3×2 cubemap atlas (left, front, right / back, top, bottom) back to equirectangular panorama."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "cubemap_atlas": ("IMAGE", {"tooltip": "Input cubemap atlas in 3×2 layout from 'Equirectangular → Cubemap' node."}),
+            },
+            "optional": {
+                "output_width": ("INT", {"default": 2048, "min": 256, "max": 8192, "step": 1, "tooltip": "Width of output equirectangular panorama (typically 2× height for standard 2:1 ratio)."}),
+                "output_height": ("INT", {"default": 1024, "min": 128, "max": 4096, "step": 1, "tooltip": "Height of output equirectangular panorama."}),
+                "layout": (["3x2"], {"default": "3x2", "tooltip": "Cubemap layout format (currently only 3×2 supported)."}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling quality: lanczos (highest), bicubic, bilinear, nearest (fastest)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("equirectangular_image",)
+    FUNCTION = "to_equirectangular"
+    CATEGORY = "LatLong"
+
+    def to_equirectangular(self,
+                          cubemap_atlas: torch.Tensor,
+                          output_width: int = 2048,
+                          output_height: int = 1024,
+                          layout: str = "3x2",
+                          interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        batch_size = cubemap_atlas.shape[0]
+        processed_images = []
+
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            atlas_numpy = cubemap_atlas[i].cpu().numpy()
+            if atlas_numpy.dtype != np.float32:
+                atlas_numpy = atlas_numpy.astype(np.float32)
+
+            equirect = EquirectangularProcessor.cubemap_to_equirectangular(
+                atlas_numpy,
+                output_width=output_width,
+                output_height=output_height,
+                layout=layout,
+                interpolation=interpolation,
+            )
+            equirect = np.clip(equirect, 0.0, 1.0).astype(np.float32)
+            processed_images.append(torch.from_numpy(equirect))
+            pbar.update(i + 1)
+
+        result = torch.stack(processed_images, dim=0)
+        return (result,)
+
+
+class EquirectangularMirrorFlip:
+    """ComfyUI node to mirror/flip equirectangular images with proper spherical wrapping."""
+    DESCRIPTION = "Mirror or flip an equirectangular image horizontally (longitude) or vertically (latitude) with proper spherical wrapping."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Equirectangular input image tensor (B,H,W,C) in [0,1]."}),
+            },
+            "optional": {
+                "mirror_horizontal": ("BOOLEAN", {"default": False, "tooltip": "Flip left-right: reverses longitude (horizontal 180° rotation)."}),
+                "mirror_vertical": ("BOOLEAN", {"default": False, "tooltip": "Flip top-bottom: inverts latitude (vertical inversion)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("flipped_image",)
+    FUNCTION = "mirror_flip"
+    CATEGORY = "LatLong"
+
+    def mirror_flip(self,
+                   image: torch.Tensor,
+                   mirror_horizontal: bool = False,
+                   mirror_vertical: bool = False) -> Tuple[torch.Tensor]:
+        batch_size = image.shape[0]
+        processed_images = []
+
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            img_numpy = image[i].cpu().numpy()
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+
+            flipped = EquirectangularProcessor.mirror_flip_equirectangular(
+                img_numpy,
+                mirror_horizontal=mirror_horizontal,
+                mirror_vertical=mirror_vertical,
+            )
+            flipped = np.clip(flipped, 0.0, 1.0).astype(np.float32)
+            processed_images.append(torch.from_numpy(flipped))
+            pbar.update(i + 1)
+
+        result = torch.stack(processed_images, dim=0)
+        return (result,)
+
+
+class EquirectangularResize:
+    """ComfyUI node to resize equirectangular images with optional aspect ratio preservation."""
+    DESCRIPTION = "Resize an equirectangular image with optional preservation of the standard 2:1 aspect ratio."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Equirectangular input image tensor (B,H,W,C) in [0,1]."}),
+            },
+            "optional": {
+                "output_width": ("INT", {"default": 2048, "min": 128, "max": 8192, "step": 1, "tooltip": "Target width in pixels."}),
+                "output_height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 1, "tooltip": "Target height (ignored if maintain_aspect is enabled; auto-calculated as width/2)."}),
+                "maintain_aspect": ("BOOLEAN", {"default": True, "tooltip": "Preserve 2:1 aspect ratio (standard equirectangular). Disable for custom dimensions."}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling quality: lanczos (highest), bicubic, bilinear, nearest (fastest)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("resized_image",)
+    FUNCTION = "resize"
+    CATEGORY = "LatLong"
+
+    def resize(self,
+              image: torch.Tensor,
+              output_width: int = 2048,
+              output_height: int = 1024,
+              maintain_aspect: bool = True,
+              interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        batch_size = image.shape[0]
+        processed_images = []
+
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            img_numpy = image[i].cpu().numpy()
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+
+            resized = EquirectangularProcessor.resize_equirectangular(
+                img_numpy,
+                output_width=output_width,
+                output_height=output_height,
+                maintain_aspect=maintain_aspect,
+                interpolation=interpolation,
+            )
+            resized = np.clip(resized, 0.0, 1.0).astype(np.float32)
+            processed_images.append(torch.from_numpy(resized))
+            pbar.update(i + 1)
+
+        result = torch.stack(processed_images, dim=0)
+        return (result,)
+
+
+class EquirectangularRotatePreset:
+    """ComfyUI node to rotate equirectangular images using preset view directions."""
+    DESCRIPTION = "Rotate an equirectangular image to preset views (front, back, left, right, up, down) with optional custom adjustments."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Equirectangular input image tensor (B,H,W,C) in [0,1]."}),
+            },
+            "optional": {
+                "preset": (["front", "back", "left", "right", "up", "down", "custom"], {"default": "front", "tooltip": "Quick preset views: front (0°), back (180°), left (-90°), right (90°), up/down (±90° pitch)."}),
+                "yaw_offset": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1, "tooltip": "Fine-tune yaw: additional horizontal rotation applied to preset (degrees)."}),
+                "pitch_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1, "tooltip": "Fine-tune pitch: additional vertical tilt applied to preset (degrees)."}),
+                "roll_offset": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.1, "tooltip": "Fine-tune roll: additional banking rotation applied to preset (degrees)."}),
+                "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1, "tooltip": "Vertical horizon shift: positive moves horizon up (degrees)."}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling quality: lanczos (highest), bicubic, bilinear, nearest (fastest)."}),
+                "backend": (["auto", "cpu", "gpu"], {"default": "auto", "tooltip": "Processing backend: auto uses GPU if available (bilinear/nearest only on GPU)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("rotated_image",)
+    FUNCTION = "rotate_preset"
+    CATEGORY = "LatLong"
+
+    def rotate_preset(self,
+                     image: torch.Tensor,
+                     preset: str = "front",
+                     yaw_offset: float = 0.0,
+                     pitch_offset: float = 0.0,
+                     roll_offset: float = 0.0,
+                     horizon_offset: float = 0.0,
+                     interpolation: str = "lanczos",
+                     backend: str = "auto") -> Tuple[torch.Tensor]:
+        # Get preset rotation values
+        preset_yaw, preset_pitch, preset_roll = EquirectangularProcessor.get_preset_rotation(preset)
+
+        # Apply offsets
+        final_yaw = preset_yaw + yaw_offset
+        final_pitch = preset_pitch + pitch_offset
+        final_roll = preset_roll + roll_offset
+
+        batch_size = image.shape[0]
+        processed_images = []
+
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            img_tensor = image[i]
+            img_numpy = img_tensor.cpu().numpy()
+
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+
+            # Choose backend
+            use_gpu = (backend == 'gpu') or (backend == 'auto' and torch.cuda.is_available())
+            if use_gpu:
+                img_dev = image[i].to('cuda')
+                proc_t = EquirectangularProcessor.torch_rotate_equirectangular(
+                    img_dev,
+                    yaw=final_yaw,
+                    pitch=final_pitch,
+                    roll=final_roll,
+                    horizon_offset=horizon_offset,
+                    interpolation=interpolation if interpolation in ('bilinear', 'nearest') else 'bilinear'
+                ).to('cpu').numpy()
+                processed_img = proc_t
+            else:
+                processed_img = EquirectangularProcessor.rotate_equirectangular(
+                    img_numpy,
+                    yaw=final_yaw,
+                    pitch=final_pitch,
+                    roll=final_roll,
+                    horizon_offset=horizon_offset,
+                    interpolation=interpolation
+                )
+
+            processed_img = np.clip(processed_img, 0.0, 1.0).astype(np.float32)
+            processed_tensor = torch.from_numpy(processed_img)
+            processed_images.append(processed_tensor)
+
+            pbar.update(i + 1)
+
+        result = torch.stack(processed_images, dim=0)
+        return (result,)
+
+
+class CubemapFacesExtract:
+    """ComfyUI node to extract individual cube faces from an equirectangular image."""
+    DESCRIPTION = "Extract individual cube faces from an equirectangular panorama, returned as separate images."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Equirectangular input image tensor (B,H,W,C) in [0,1]."}),
+            },
+            "optional": {
+                "face_size": ("INT", {"default": 512, "min": 16, "max": 4096, "step": 1, "tooltip": "Resolution per cube face in pixels (each output will be face_size × face_size)."}),
+                "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling quality: lanczos (highest), bicubic, bilinear, nearest (fastest)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("left", "front", "right", "back", "top", "bottom")
+    FUNCTION = "extract_faces"
+    CATEGORY = "LatLong"
+
+    def extract_faces(self,
+                     image: torch.Tensor,
+                     face_size: int = 512,
+                     interpolation: str = "lanczos") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = image.shape[0]
+
+        left_faces = []
+        front_faces = []
+        right_faces = []
+        back_faces = []
+        top_faces = []
+        bottom_faces = []
+
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            img_numpy = image[i].cpu().numpy()
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+
+            # Generate cubemap atlas (3x2)
+            atlas = EquirectangularProcessor.equirectangular_to_cubemap(
+                img_numpy,
+                face_size=face_size,
+                layout="3x2",
+                interpolation=interpolation,
+            )
+
+            # Extract individual faces from atlas
+            # Layout: [left, front, right] / [back, top, bottom]
+            left = atlas[0:face_size, 0:face_size]
+            front = atlas[0:face_size, face_size:2*face_size]
+            right = atlas[0:face_size, 2*face_size:3*face_size]
+            back = atlas[face_size:2*face_size, 0:face_size]
+            top = atlas[face_size:2*face_size, face_size:2*face_size]
+            bottom = atlas[face_size:2*face_size, 2*face_size:3*face_size]
+
+            # Convert to tensors and append
+            left_faces.append(torch.from_numpy(np.clip(left, 0.0, 1.0).astype(np.float32)))
+            front_faces.append(torch.from_numpy(np.clip(front, 0.0, 1.0).astype(np.float32)))
+            right_faces.append(torch.from_numpy(np.clip(right, 0.0, 1.0).astype(np.float32)))
+            back_faces.append(torch.from_numpy(np.clip(back, 0.0, 1.0).astype(np.float32)))
+            top_faces.append(torch.from_numpy(np.clip(top, 0.0, 1.0).astype(np.float32)))
+            bottom_faces.append(torch.from_numpy(np.clip(bottom, 0.0, 1.0).astype(np.float32)))
+
+            pbar.update(i + 1)
+
+        # Stack into batches
+        left_batch = torch.stack(left_faces, dim=0)
+        front_batch = torch.stack(front_faces, dim=0)
+        right_batch = torch.stack(right_faces, dim=0)
+        back_batch = torch.stack(back_faces, dim=0)
+        top_batch = torch.stack(top_faces, dim=0)
+        bottom_batch = torch.stack(bottom_faces, dim=0)
+
+        return (left_batch, front_batch, right_batch, back_batch, top_batch, bottom_batch)

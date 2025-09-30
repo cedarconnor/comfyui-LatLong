@@ -550,3 +550,248 @@ class EquirectangularProcessor:
         atlas[face_size:2*face_size, 2*face_size:3*face_size] = render_face('bottom')
 
         return atlas
+
+    @classmethod
+    def cubemap_to_equirectangular(cls,
+                                    cubemap_atlas: np.ndarray,
+                                    output_width: int = 2048,
+                                    output_height: int = 1024,
+                                    layout: str = '3x2',
+                                    interpolation: str = 'lanczos') -> np.ndarray:
+        """Convert a 3x2 cubemap atlas back to equirectangular format.
+
+        Args:
+            cubemap_atlas: Input atlas with shape (2*face_size, 3*face_size, C).
+            output_width: Width of output equirectangular image.
+            output_height: Height of output equirectangular image.
+            layout: Cubemap layout (currently only '3x2' supported).
+            interpolation: Resampling method.
+
+        Returns:
+            Equirectangular image of shape (output_height, output_width, C).
+        """
+        if layout != '3x2':
+            raise ValueError("Only '3x2' layout is currently supported")
+
+        # Extract face size from atlas
+        atlas_h, atlas_w = cubemap_atlas.shape[:2]
+        face_size = atlas_h // 2
+
+        # Extract individual faces from atlas
+        # Layout: [left, front, right] / [back, top, bottom]
+        faces = {
+            'left': cubemap_atlas[0:face_size, 0:face_size],
+            'front': cubemap_atlas[0:face_size, face_size:2*face_size],
+            'right': cubemap_atlas[0:face_size, 2*face_size:3*face_size],
+            'back': cubemap_atlas[face_size:2*face_size, 0:face_size],
+            'top': cubemap_atlas[face_size:2*face_size, face_size:2*face_size],
+            'bottom': cubemap_atlas[face_size:2*face_size, 2*face_size:3*face_size],
+        }
+
+        # Create output coordinate grid
+        xs = np.linspace(0.5, output_width - 0.5, output_width, dtype=np.float32)
+        ys = np.linspace(0.5, output_height - 0.5, output_height, dtype=np.float32)
+        x_grid, y_grid = np.meshgrid(xs, ys)
+
+        # Convert to spherical coordinates
+        lat, lon = cls.equirectangular_to_spherical(x_grid, y_grid, output_width, output_height)
+
+        # Convert to 3D Cartesian
+        x, y, z = cls.spherical_to_cartesian(lat, lon)
+
+        # Determine which face each pixel should sample from
+        abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
+
+        # Initialize output
+        output = np.zeros((output_height, output_width, cubemap_atlas.shape[2]), dtype=cubemap_atlas.dtype)
+
+        def sample_face(face_name: str, mask: np.ndarray):
+            """Sample from a specific cube face for masked pixels."""
+            if not np.any(mask):
+                return
+
+            face_img = faces[face_name]
+            x_m, y_m, z_m = x[mask], y[mask], z[mask]
+
+            # Map 3D direction to face UV coordinates
+            if face_name == 'front':  # +X
+                u = y_m / x_m
+                v = z_m / x_m
+            elif face_name == 'back':  # -X
+                u = -y_m / -x_m
+                v = z_m / -x_m
+            elif face_name == 'right':  # +Y
+                u = -x_m / y_m
+                v = z_m / y_m
+            elif face_name == 'left':  # -Y
+                u = x_m / -y_m
+                v = z_m / -y_m
+            elif face_name == 'top':  # +Z
+                u = x_m / z_m
+                v = y_m / z_m
+            elif face_name == 'bottom':  # -Z
+                u = x_m / -z_m
+                v = -y_m / -z_m
+
+            # Convert UV from [-1, 1] to pixel coordinates [0, face_size-1]
+            u_px = (u + 1.0) * 0.5 * (face_size - 1)
+            v_px = (v + 1.0) * 0.5 * (face_size - 1)
+
+            # Clamp to valid range
+            u_px = np.clip(u_px, 0, face_size - 1)
+            v_px = np.clip(v_px, 0, face_size - 1)
+
+            # Interpolate using cv2.remap
+            if interpolation == 'nearest':
+                cv_interp = cv2.INTER_NEAREST
+            elif interpolation == 'bilinear':
+                cv_interp = cv2.INTER_LINEAR
+            elif interpolation == 'bicubic':
+                cv_interp = cv2.INTER_CUBIC
+            else:
+                cv_interp = cv2.INTER_LANCZOS4
+
+            # Create a dense grid for the masked region
+            mask_indices = np.where(mask)
+            for i, (row, col) in enumerate(zip(mask_indices[0], mask_indices[1])):
+                # Sample individual pixel
+                x_sample = u_px[i]
+                y_sample = v_px[i]
+
+                if interpolation == 'nearest':
+                    x_int = int(np.round(x_sample))
+                    y_int = int(np.round(y_sample))
+                    output[row, col] = face_img[y_int, x_int]
+                else:
+                    # Bilinear interpolation
+                    x0 = int(np.floor(x_sample))
+                    x1 = min(x0 + 1, face_size - 1)
+                    y0 = int(np.floor(y_sample))
+                    y1 = min(y0 + 1, face_size - 1)
+
+                    wx1 = x_sample - x0
+                    wx0 = 1.0 - wx1
+                    wy1 = y_sample - y0
+                    wy0 = 1.0 - wy1
+
+                    output[row, col] = (
+                        face_img[y0, x0] * wx0 * wy0 +
+                        face_img[y0, x1] * wx1 * wy0 +
+                        face_img[y1, x0] * wx0 * wy1 +
+                        face_img[y1, x1] * wx1 * wy1
+                    )
+
+        # Determine face selection for each pixel
+        front_mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x > 0)
+        back_mask = (abs_x >= abs_y) & (abs_x >= abs_z) & (x < 0)
+        right_mask = (abs_y >= abs_x) & (abs_y >= abs_z) & (y > 0)
+        left_mask = (abs_y >= abs_x) & (abs_y >= abs_z) & (y < 0)
+        top_mask = (abs_z >= abs_x) & (abs_z >= abs_y) & (z > 0)
+        bottom_mask = (abs_z >= abs_x) & (abs_z >= abs_y) & (z < 0)
+
+        # Sample from each face
+        sample_face('front', front_mask)
+        sample_face('back', back_mask)
+        sample_face('right', right_mask)
+        sample_face('left', left_mask)
+        sample_face('top', top_mask)
+        sample_face('bottom', bottom_mask)
+
+        return output
+
+    @staticmethod
+    def mirror_flip_equirectangular(image: np.ndarray,
+                                    mirror_horizontal: bool = False,
+                                    mirror_vertical: bool = False) -> np.ndarray:
+        """Mirror/flip an equirectangular image with proper spherical wrapping.
+
+        Args:
+            image: Input equirectangular image.
+            mirror_horizontal: Flip left-right (longitude flip).
+            mirror_vertical: Flip top-bottom (latitude flip).
+
+        Returns:
+            Flipped equirectangular image.
+        """
+        result = image.copy()
+
+        if mirror_horizontal:
+            # Horizontal flip: reverse longitude (flip left-right)
+            result = np.fliplr(result)
+
+        if mirror_vertical:
+            # Vertical flip: reverse latitude (flip top-bottom)
+            result = np.flipud(result)
+
+        return result
+
+    @staticmethod
+    def resize_equirectangular(image: np.ndarray,
+                               output_width: Optional[int] = None,
+                               output_height: Optional[int] = None,
+                               maintain_aspect: bool = True,
+                               interpolation: str = 'lanczos') -> np.ndarray:
+        """Resize an equirectangular image with optional aspect ratio preservation.
+
+        Args:
+            image: Input equirectangular image.
+            output_width: Target width (required if maintain_aspect=False).
+            output_height: Target height (optional if maintain_aspect=True).
+            maintain_aspect: Preserve 2:1 aspect ratio (standard for equirectangular).
+            interpolation: Resampling method.
+
+        Returns:
+            Resized equirectangular image.
+        """
+        h, w = image.shape[:2]
+
+        if maintain_aspect:
+            # Standard equirectangular is 2:1 ratio
+            if output_width is not None:
+                out_w = output_width
+                out_h = output_width // 2
+            elif output_height is not None:
+                out_h = output_height
+                out_w = output_height * 2
+            else:
+                raise ValueError("Either output_width or output_height must be specified")
+        else:
+            if output_width is None or output_height is None:
+                raise ValueError("Both output_width and output_height must be specified when maintain_aspect=False")
+            out_w = output_width
+            out_h = output_height
+
+        # Map interpolation to OpenCV
+        if interpolation == 'nearest':
+            cv_interp = cv2.INTER_NEAREST
+        elif interpolation == 'bilinear':
+            cv_interp = cv2.INTER_LINEAR
+        elif interpolation == 'bicubic':
+            cv_interp = cv2.INTER_CUBIC
+        elif interpolation == 'lanczos':
+            cv_interp = cv2.INTER_LANCZOS4
+        else:
+            cv_interp = cv2.INTER_LANCZOS4
+
+        resized = cv2.resize(image, (out_w, out_h), interpolation=cv_interp)
+        return resized
+
+    @staticmethod
+    def get_preset_rotation(preset: str) -> Tuple[float, float, float]:
+        """Get yaw, pitch, roll values for preset rotation angles.
+
+        Args:
+            preset: One of 'front', 'back', 'left', 'right', 'up', 'down', 'custom'.
+
+        Returns:
+            Tuple of (yaw, pitch, roll) in degrees.
+        """
+        presets = {
+            'front': (0.0, 0.0, 0.0),
+            'back': (180.0, 0.0, 0.0),
+            'left': (-90.0, 0.0, 0.0),
+            'right': (90.0, 0.0, 0.0),
+            'up': (0.0, 90.0, 0.0),
+            'down': (0.0, -90.0, 0.0),
+        }
+        return presets.get(preset, (0.0, 0.0, 0.0))
