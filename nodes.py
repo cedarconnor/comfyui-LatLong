@@ -33,6 +33,8 @@ class EquirectangularRotate:
                 "horizon_offset": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.1, "tooltip": "Vertical horizon shift (degrees). Positive values move the horizon up."}),
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling filter used during rotation remap."}),
                 "backend": (["auto", "cpu", "gpu"], {"default": "auto", "tooltip": "Processing backend. Auto uses GPU if available (bilinear/nearest)."}),
+                "use_tiling": (["auto", "enabled", "disabled"], {"default": "auto", "tooltip": "Tiled processing for 16K+ images. Auto enables for >8K images. Reduces memory usage."}),
+                "tile_size": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 512, "tooltip": "Tile size in pixels for tiled processing. Smaller = less memory, more tiles."}),
             }
         }
     
@@ -48,7 +50,9 @@ class EquirectangularRotate:
                              roll_rotation: float = 0.0,
                              horizon_offset: float = 0.0,
                              interpolation: str = "lanczos",
-                             backend: str = "auto") -> Tuple[torch.Tensor]:
+                             backend: str = "auto",
+                             use_tiling: str = "auto",
+                             tile_size: int = 2048) -> Tuple[torch.Tensor]:
         
         # Convert ComfyUI tensor format (B, H, W, C) to numpy
         batch_size = image.shape[0]
@@ -61,11 +65,19 @@ class EquirectangularRotate:
             # Get single image and convert to numpy
             img_tensor = image[i]  # (H, W, C)
             img_numpy = img_tensor.cpu().numpy()
-            
+
             # Keep float32 for processing to avoid value clipping
             if img_numpy.dtype != np.float32:
                 img_numpy = img_numpy.astype(np.float32)
-            
+
+            # Determine tiling setting
+            use_tiling_bool = None  # Let processor auto-decide
+            if use_tiling == "enabled":
+                use_tiling_bool = True
+            elif use_tiling == "disabled":
+                use_tiling_bool = False
+            # else: "auto" means None, which auto-decides based on image size
+
             # Choose backend
             use_gpu = (backend == 'gpu') or (backend == 'auto' and torch.cuda.is_available())
             if use_gpu:
@@ -86,7 +98,9 @@ class EquirectangularRotate:
                     pitch=pitch_rotation,
                     roll=roll_rotation,
                     horizon_offset=horizon_offset,
-                    interpolation=interpolation
+                    interpolation=interpolation,
+                    use_tiling=use_tiling_bool,
+                    tile_size=tile_size
                 )
             
             # Ensure output is float32 in [0,1] range
