@@ -10,6 +10,8 @@ from .nodes import (
     EquirectangularResize,
     EquirectangularRotatePreset,
     CubemapFacesExtract,
+    PanoramaViewerNode,
+    PanoramaVideoViewerNode,
 )
 
 
@@ -25,6 +27,8 @@ NODE_CLASS_MAPPINGS = {
     "Equirectangular Resize": EquirectangularResize,
     "Equirectangular Rotate Preset": EquirectangularRotatePreset,
     "Cubemap Faces Extract": CubemapFacesExtract,
+    "PanoramaViewerNode": PanoramaViewerNode,
+    "PanoramaVideoViewerNode": PanoramaVideoViewerNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -39,6 +43,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Equirectangular Resize": "Equirectangular Resize",
     "Equirectangular Rotate Preset": "Equirectangular Rotate (Preset)",
     "Cubemap Faces Extract": "Cubemap Faces Extract",
+    "PanoramaViewerNode": "Preview 360 Panorama",
+    "PanoramaVideoViewerNode": "Preview 360 Video Panorama",
 }
 
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+WEB_DIRECTORY = "./js"
+
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
