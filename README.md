@@ -128,9 +128,26 @@ GPU Notes
 - Inputs: `image`, `output_width`, `output_height`, `maintain_aspect`, `interpolation`
 - Features: Auto-maintains 2:1 aspect ratio (standard equirectangular) or custom dimensions
 
+### Post-Processing Nodes
+
+12) **Equirectangular Edge Blender**
+- Purpose: Blend left and right edges for seamless wraparound continuity.
+- **NEW**: Essential for eliminating visible seams in 360° viewers
+- Inputs:
+  - `image`: Equirectangular panoramic image
+  - `blend_width`: Blend region width in pixels (10-20 recommended)
+  - `blend_mode`: cosine | linear | smooth (cosine smoothest)
+  - `check_continuity`: Validate seamlessness after blending
+- Use Case: Final polish step to ensure perfect wraparound in interactive viewers
+- Features:
+  - Three blending modes (cosine recommended for smoothest results)
+  - Automatic edge continuity validation
+  - Configurable blend width for different image resolutions
+  - Reports seamless status to console
+
 ### Interactive Viewer Nodes
 
-12) **Preview 360 Panorama**
+13) **Preview 360 Panorama**
 - Purpose: Interactive 360° panorama viewer with real-time navigation.
 - Features:
   - Three.js-based WebGL rendering
@@ -140,7 +157,7 @@ GPU Notes
 - Inputs: `images` (equirectangular), `max_width` (resize limit, default 4096)
 - Use Case: Preview and explore panoramas directly in ComfyUI workflow
 
-13) **Preview 360 Video Panorama**
+14) **Preview 360 Video Panorama**
 - Purpose: Interactive 360° video panorama viewer with frame-by-frame playback.
 - Features:
   - Frame-by-frame 360° video playback
@@ -193,6 +210,9 @@ GPU Notes
 
 **Processing 16K Images**
 - Load a 16K (16384×8192) panorama into Equirectangular Rotate, set `use_tiling` to "auto", adjust rotation parameters, and process without memory errors.
+
+**Edge Blending for Seamless Wraparound**
+- Add Equirectangular Edge Blender after rotation/processing, set `blend_width` to 10-20, choose "cosine" mode, enable continuity check to validate seamless edges.
 
 ## Technical Notes
 

@@ -958,3 +958,102 @@ class EquirectangularProcessor:
             'down': (0.0, -90.0, 0.0),
         }
         return presets.get(preset, (0.0, 0.0, 0.0))
+
+    @staticmethod
+    def blend_edges(image: np.ndarray, blend_width: int = 10,
+                   mode: str = "cosine") -> np.ndarray:
+        """Blend left and right edges for seamless wraparound.
+
+        Creates a smooth transition between the left and right edges of a panorama
+        to ensure seamless wraparound when viewed in 360° viewers.
+
+        Args:
+            image: Input image in (H, W, C) format
+            blend_width: Width of blend region in pixels (default 10)
+            mode: Blending function:
+                - 'linear': Simple linear interpolation
+                - 'cosine': Smooth cosine interpolation (recommended)
+                - 'smooth': Quadratic smooth interpolation
+
+        Returns:
+            Image with blended edges
+
+        Example:
+            >>> panorama = np.random.rand(1024, 2048, 3)
+            >>> blended = blend_edges(panorama, blend_width=20, mode="cosine")
+            >>> # Left and right edges now transition smoothly
+        """
+        H, W = image.shape[:2]
+
+        # Validate blend width
+        if blend_width <= 0 or blend_width >= W // 2:
+            print(f"Warning: blend_width {blend_width} invalid, must be 0 < width < {W//2}")
+            return image
+
+        # Extract edge regions
+        left_edge = image[:, :blend_width, :].copy()
+        right_edge = image[:, -blend_width:, :].copy()
+
+        # Create blend weights based on mode
+        if mode == "linear":
+            # Simple linear ramp: 0 -> 1
+            weights = np.linspace(0, 1, blend_width)
+
+        elif mode == "cosine":
+            # Smooth cosine curve: 0 -> 1
+            # Uses (1 - cos(πx)) / 2 for smooth S-curve
+            t = np.linspace(0, np.pi, blend_width)
+            weights = (1 - np.cos(t)) / 2
+
+        elif mode == "smooth":
+            # Quadratic smooth: x²
+            weights = np.linspace(0, 1, blend_width) ** 2
+
+        else:
+            raise ValueError(f"Unknown blend mode: {mode}. Use 'linear', 'cosine', or 'smooth'")
+
+        # Reshape weights for broadcasting: (1, blend_width, 1)
+        weights = weights.reshape(1, -1, 1)
+
+        # Blend edges using weighted average
+        # Left edge: transitions from left_edge to right_edge
+        # Right edge: transitions from right_edge to left_edge
+        blended_left = left_edge * (1 - weights) + right_edge * weights
+        blended_right = right_edge * (1 - weights) + left_edge * weights
+
+        # Apply blending to image
+        result = image.copy()
+        result[:, :blend_width, :] = blended_left
+        result[:, -blend_width:, :] = blended_right
+
+        return result
+
+    @staticmethod
+    def check_edge_continuity(image: np.ndarray, threshold: float = 0.05) -> bool:
+        """Check if left and right edges are continuous (for validation).
+
+        Measures the average pixel difference between the leftmost and rightmost
+        columns to determine if the panorama wraps seamlessly.
+
+        Args:
+            image: Input image in (H, W, C) format
+            threshold: Maximum allowed difference (0-1 scale). Default 0.05 = 5%
+
+        Returns:
+            True if edges are continuous within threshold
+
+        Example:
+            >>> panorama = np.random.rand(1024, 2048, 3)
+            >>> panorama = blend_edges(panorama)
+            >>> check_edge_continuity(panorama)
+            True
+            >>> # Without blending, likely returns False
+        """
+        # Get leftmost and rightmost columns
+        left_edge = image[:, 0, :]   # (H, C)
+        right_edge = image[:, -1, :]  # (H, C)
+
+        # Calculate mean absolute difference
+        diff = np.abs(left_edge - right_edge).mean()
+
+        return diff < threshold
