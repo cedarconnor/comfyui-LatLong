@@ -1,14 +1,62 @@
 import numpy as np
 import torch
 import cv2
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from functools import lru_cache
 from scipy.spatial.transform import Rotation
+import gc
 
 
 class EquirectangularProcessor:
     def __init__(self):
         pass
+
+    @staticmethod
+    def calculate_optimal_tile_size(image_width: int, image_height: int,
+                                     max_memory_mb: float = 2048) -> Tuple[int, int]:
+        """Calculate optimal tile size for processing large images.
+
+        Args:
+            image_width: Width of the image
+            image_height: Height of the image
+            max_memory_mb: Maximum memory per tile in megabytes
+
+        Returns:
+            Tuple of (tile_height, tile_width) in pixels
+        """
+        # Estimate memory per pixel (3 channels * 4 bytes float32 + overhead)
+        bytes_per_pixel = 3 * 4 * 2  # *2 for input + output buffers
+        max_pixels = (max_memory_mb * 1024 * 1024) / bytes_per_pixel
+
+        # For 16K images (16384x8192), aim for 4-16 tiles
+        # Calculate square-ish tiles that fit within memory constraints
+        if image_width * image_height <= max_pixels:
+            # Image fits in memory, no tiling needed
+            return (image_height, image_width)
+
+        # Calculate number of tiles needed
+        num_tiles = int(np.ceil((image_width * image_height) / max_pixels))
+        tiles_per_row = int(np.ceil(np.sqrt(num_tiles)))
+
+        tile_height = image_height // tiles_per_row
+        tile_width = image_width // tiles_per_row
+
+        return (tile_height, tile_width)
+
+    @staticmethod
+    def should_use_tiled_processing(image_width: int, image_height: int,
+                                     tile_threshold_px: int = 8192) -> bool:
+        """Determine if tiled processing should be used.
+
+        Args:
+            image_width: Width of the image
+            image_height: Height of the image
+            tile_threshold_px: Threshold dimension to trigger tiling
+
+        Returns:
+            True if tiling should be used
+        """
+        return image_width > tile_threshold_px or image_height > tile_threshold_px
     
     @staticmethod
     def equirectangular_to_spherical(x: np.ndarray, y: np.ndarray, width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -109,37 +157,152 @@ class EquirectangularProcessor:
         return EquirectangularProcessor.interpolate_image(image, x, y, method='bilinear')
     
     @classmethod
-    def rotate_equirectangular(cls, image: np.ndarray, yaw: float = 0, pitch: float = 0, roll: float = 0, horizon_offset: float = 0, interpolation: str = 'lanczos') -> np.ndarray:
-        """Rotate an equirectangular image with optional horizon adjustment"""
+    def rotate_equirectangular(cls, image: np.ndarray, yaw: float = 0, pitch: float = 0, roll: float = 0,
+                              horizon_offset: float = 0, interpolation: str = 'lanczos',
+                              use_tiling: Optional[bool] = None, tile_size: int = 2048,
+                              overlap: int = 64) -> np.ndarray:
+        """Rotate an equirectangular image with optional horizon adjustment.
+
+        Args:
+            image: Input equirectangular image
+            yaw, pitch, roll: Rotation angles in degrees
+            horizon_offset: Vertical horizon shift in degrees
+            interpolation: Interpolation method
+            use_tiling: Force tiling on/off. If None, auto-decide based on image size
+            tile_size: Size of tiles for tiled processing
+            overlap: Pixel overlap between tiles to avoid seams
+
+        Returns:
+            Rotated equirectangular image
+        """
         height, width = image.shape[:2]
-        
+
+        # Decide whether to use tiling
+        if use_tiling is None:
+            use_tiling = cls.should_use_tiled_processing(width, height)
+
+        if not use_tiling:
+            # Original non-tiled implementation
+            return cls._rotate_equirectangular_direct(image, yaw, pitch, roll,
+                                                     horizon_offset, interpolation)
+        else:
+            # Tiled implementation for large images
+            return cls._rotate_equirectangular_tiled(image, yaw, pitch, roll,
+                                                    horizon_offset, interpolation,
+                                                    tile_size, overlap)
+
+    @classmethod
+    def _rotate_equirectangular_direct(cls, image: np.ndarray, yaw: float, pitch: float,
+                                       roll: float, horizon_offset: float,
+                                       interpolation: str) -> np.ndarray:
+        """Direct (non-tiled) rotation implementation."""
+        height, width = image.shape[:2]
+
         # Create coordinate grids
         x_coords, y_coords = np.meshgrid(np.arange(width), np.arange(height))
-        
+
         # Convert to spherical coordinates
         lat, lon = cls.equirectangular_to_spherical(x_coords, y_coords, width, height)
-        
+
         # Apply horizon offset
         lat += np.radians(horizon_offset)
         lat = np.clip(lat, -np.pi/2, np.pi/2)  # Clamp to valid latitude range
-        
+
         # Convert to 3D cartesian
         x_3d, y_3d, z_3d = cls.spherical_to_cartesian(lat, lon)
-        
+
         # Create and apply rotation matrix
         rotation_matrix = cls.create_rotation_matrix(yaw, pitch, roll)
         x_rot, y_rot, z_rot = cls.apply_rotation(x_3d, y_3d, z_3d, rotation_matrix)
-        
+
         # Convert back to spherical
         lat_rot, lon_rot = cls.cartesian_to_spherical(x_rot, y_rot, z_rot)
-        
+
         # Convert back to equirectangular coordinates
         x_new, y_new = cls.spherical_to_equirectangular(lat_rot, lon_rot, width, height)
-        
+
         # Interpolate to get final image with specified method (interpolator wraps horizontally)
         rotated_image = cls.interpolate_image(image, x_new, y_new, method=interpolation)
 
         return rotated_image
+
+    @classmethod
+    def _rotate_equirectangular_tiled(cls, image: np.ndarray, yaw: float, pitch: float,
+                                     roll: float, horizon_offset: float, interpolation: str,
+                                     tile_size: int, overlap: int) -> np.ndarray:
+        """Tiled rotation implementation for large images.
+
+        Processes the image in horizontal bands to reduce memory usage.
+        Each band has an overlap region to avoid seam artifacts.
+        """
+        height, width = image.shape[:2]
+        result = np.zeros_like(image)
+
+        # Pre-compute rotation matrix once
+        rotation_matrix = cls.create_rotation_matrix(yaw, pitch, roll)
+
+        # Process in horizontal bands
+        num_bands = int(np.ceil(height / tile_size))
+
+        for band_idx in range(num_bands):
+            # Calculate band boundaries with overlap
+            y_start = max(0, band_idx * tile_size - overlap)
+            y_end = min(height, (band_idx + 1) * tile_size + overlap)
+            band_height = y_end - y_start
+
+            # Create coordinate grids for this band only
+            x_coords, y_coords = np.meshgrid(np.arange(width), np.arange(y_start, y_end))
+
+            # Convert to spherical coordinates
+            lat, lon = cls.equirectangular_to_spherical(x_coords, y_coords, width, height)
+
+            # Apply horizon offset
+            lat += np.radians(horizon_offset)
+            lat = np.clip(lat, -np.pi/2, np.pi/2)
+
+            # Convert to 3D cartesian
+            x_3d, y_3d, z_3d = cls.spherical_to_cartesian(lat, lon)
+
+            # Apply pre-computed rotation
+            x_rot, y_rot, z_rot = cls.apply_rotation(x_3d, y_3d, z_3d, rotation_matrix)
+
+            # Convert back to spherical
+            lat_rot, lon_rot = cls.cartesian_to_spherical(x_rot, y_rot, z_rot)
+
+            # Convert back to equirectangular coordinates
+            x_new, y_new = cls.spherical_to_equirectangular(lat_rot, lon_rot, width, height)
+
+            # Interpolate this band
+            band_rotated = cls.interpolate_image(image, x_new, y_new, method=interpolation)
+
+            # Calculate the actual region to copy (excluding overlap margins)
+            if band_idx == 0:
+                # First band: no overlap at top
+                result_y_start = 0
+                band_y_start = 0
+                result_y_end = min(tile_size, height)
+                band_y_end = result_y_end - y_start
+            elif band_idx == num_bands - 1:
+                # Last band: no overlap at bottom
+                result_y_start = band_idx * tile_size
+                band_y_start = result_y_start - y_start
+                result_y_end = height
+                band_y_end = band_height
+            else:
+                # Middle bands: use center region, avoiding overlaps
+                result_y_start = band_idx * tile_size
+                band_y_start = overlap
+                result_y_end = min((band_idx + 1) * tile_size, height)
+                band_y_end = band_y_start + (result_y_end - result_y_start)
+
+            # Copy the band to result
+            result[result_y_start:result_y_end, :] = band_rotated[band_y_start:band_y_end, :]
+
+            # Free memory
+            del x_coords, y_coords, lat, lon, x_3d, y_3d, z_3d
+            del x_rot, y_rot, z_rot, lat_rot, lon_rot, x_new, y_new, band_rotated
+
+        return result
     
     @staticmethod
     def crop_to_180(image: np.ndarray,
@@ -795,3 +958,102 @@ class EquirectangularProcessor:
             'down': (0.0, -90.0, 0.0),
         }
         return presets.get(preset, (0.0, 0.0, 0.0))
+
+    @staticmethod
+    def blend_edges(image: np.ndarray, blend_width: int = 10,
+                   mode: str = "cosine") -> np.ndarray:
+        """Blend left and right edges for seamless wraparound.
+
+        Creates a smooth transition between the left and right edges of a panorama
+        to ensure seamless wraparound when viewed in 360° viewers.
+
+        Args:
+            image: Input image in (H, W, C) format
+            blend_width: Width of blend region in pixels (default 10)
+            mode: Blending function:
+                - 'linear': Simple linear interpolation
+                - 'cosine': Smooth cosine interpolation (recommended)
+                - 'smooth': Quadratic smooth interpolation
+
+        Returns:
+            Image with blended edges
+
+        Example:
+            >>> panorama = np.random.rand(1024, 2048, 3)
+            >>> blended = blend_edges(panorama, blend_width=20, mode="cosine")
+            >>> # Left and right edges now transition smoothly
+        """
+        H, W = image.shape[:2]
+
+        # Validate blend width
+        if blend_width <= 0 or blend_width >= W // 2:
+            print(f"Warning: blend_width {blend_width} invalid, must be 0 < width < {W//2}")
+            return image
+
+        # Extract edge regions
+        left_edge = image[:, :blend_width, :].copy()
+        right_edge = image[:, -blend_width:, :].copy()
+
+        # Create blend weights based on mode
+        if mode == "linear":
+            # Simple linear ramp: 0 -> 1
+            weights = np.linspace(0, 1, blend_width)
+
+        elif mode == "cosine":
+            # Smooth cosine curve: 0 -> 1
+            # Uses (1 - cos(πx)) / 2 for smooth S-curve
+            t = np.linspace(0, np.pi, blend_width)
+            weights = (1 - np.cos(t)) / 2
+
+        elif mode == "smooth":
+            # Quadratic smooth: x²
+            weights = np.linspace(0, 1, blend_width) ** 2
+
+        else:
+            raise ValueError(f"Unknown blend mode: {mode}. Use 'linear', 'cosine', or 'smooth'")
+
+        # Reshape weights for broadcasting: (1, blend_width, 1)
+        weights = weights.reshape(1, -1, 1)
+
+        # Blend edges using weighted average
+        # Left edge: transitions from left_edge to right_edge
+        # Right edge: transitions from right_edge to left_edge
+        blended_left = left_edge * (1 - weights) + right_edge * weights
+        blended_right = right_edge * (1 - weights) + left_edge * weights
+
+        # Apply blending to image
+        result = image.copy()
+        result[:, :blend_width, :] = blended_left
+        result[:, -blend_width:, :] = blended_right
+
+        return result
+
+    @staticmethod
+    def check_edge_continuity(image: np.ndarray, threshold: float = 0.05) -> bool:
+        """Check if left and right edges are continuous (for validation).
+
+        Measures the average pixel difference between the leftmost and rightmost
+        columns to determine if the panorama wraps seamlessly.
+
+        Args:
+            image: Input image in (H, W, C) format
+            threshold: Maximum allowed difference (0-1 scale). Default 0.05 = 5%
+
+        Returns:
+            True if edges are continuous within threshold
+
+        Example:
+            >>> panorama = np.random.rand(1024, 2048, 3)
+            >>> panorama = blend_edges(panorama)
+            >>> check_edge_continuity(panorama)
+            True
+            >>> # Without blending, likely returns False
+        """
+        # Get leftmost and rightmost columns
+        left_edge = image[:, 0, :]   # (H, C)
+        right_edge = image[:, -1, :]  # (H, C)
+
+        # Calculate mean absolute difference
+        diff = np.abs(left_edge - right_edge).mean()
+
+        return diff < threshold

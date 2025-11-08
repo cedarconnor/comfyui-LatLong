@@ -12,6 +12,7 @@ from .nodes import (
     CubemapFacesExtract,
     PanoramaViewerNode,
     PanoramaVideoViewerNode,
+    EquirectangularEdgeBlender,
 )
 
 
@@ -29,6 +30,7 @@ NODE_CLASS_MAPPINGS = {
     "Cubemap Faces Extract": CubemapFacesExtract,
     "PanoramaViewerNode": PanoramaViewerNode,
     "PanoramaVideoViewerNode": PanoramaVideoViewerNode,
+    "Equirectangular Edge Blender": EquirectangularEdgeBlender,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -45,6 +47,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Cubemap Faces Extract": "Cubemap Faces Extract",
     "PanoramaViewerNode": "Preview 360 Panorama",
     "PanoramaVideoViewerNode": "Preview 360 Video Panorama",
+    "Equirectangular Edge Blender": "Equirectangular Edge Blender",
 }
 
 WEB_DIRECTORY = "./js"
