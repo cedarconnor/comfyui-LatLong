@@ -1,7 +1,8 @@
 import os
+import copy
 import torch
 import numpy as np
-from typing import Tuple, Optional, Dict
+from typing import Any, Dict, List, Optional, Tuple
 import base64
 from io import BytesIO
 
@@ -13,6 +14,144 @@ from .modules.equirectangular_processor import EquirectangularProcessor
 
 
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+_CUBEMAP_CANONICAL_FACES = ("front", "right", "back", "left", "up", "down")
+_CUBEMAP_FACE_SYNONYMS = {
+    "f": "front",
+    "front": "front",
+    "r": "right",
+    "right": "right",
+    "b": "back",
+    "back": "back",
+    "l": "left",
+    "left": "left",
+    "u": "up",
+    "up": "up",
+    "top": "up",
+    "d": "down",
+    "down": "down",
+    "bottom": "down",
+}
+
+
+def _tokenize_face_order(face_order: str) -> List[str]:
+    normalized = face_order.replace("|", ",").replace(";", ",")
+    tokens: List[str] = []
+    for part in normalized.split(","):
+        for token in part.strip().split():
+            if token:
+                tokens.append(token)
+    return tokens
+
+
+def _parse_face_order(face_order: str) -> List[str]:
+    tokens = _tokenize_face_order(face_order)
+    faces: List[str] = []
+    for token in tokens:
+        key = token.strip().lower()
+        if key not in _CUBEMAP_FACE_SYNONYMS:
+            raise ValueError(
+                f"Unknown face token '{token}'. Use one of: "
+                + ", ".join(sorted(set(_CUBEMAP_FACE_SYNONYMS.keys())))
+            )
+        faces.append(_CUBEMAP_FACE_SYNONYMS[key])
+
+    if len(faces) != 6:
+        raise ValueError(
+            f"face_order must specify 6 faces, got {len(faces)}: {faces}. "
+            "Example: 'F,R,B,L,U,D'"
+        )
+    if len(set(faces)) != 6:
+        raise ValueError(
+            f"face_order must contain each face exactly once, got: {faces}"
+        )
+    return faces
+
+
+def _faces_from_atlas_3x2(atlas: np.ndarray, face_size: int) -> Dict[str, np.ndarray]:
+    return {
+        "left": atlas[0:face_size, 0:face_size],
+        "front": atlas[0:face_size, face_size : 2 * face_size],
+        "right": atlas[0:face_size, 2 * face_size : 3 * face_size],
+        "back": atlas[face_size : 2 * face_size, 0:face_size],
+        "up": atlas[face_size : 2 * face_size, face_size : 2 * face_size],
+        "down": atlas[face_size : 2 * face_size, 2 * face_size : 3 * face_size],
+    }
+
+
+def _ensure_face_3d(face: np.ndarray) -> np.ndarray:
+    return face[:, :, None] if face.ndim == 2 else face
+
+
+def _atlas_3x2_from_faces(faces: Dict[str, np.ndarray]) -> np.ndarray:
+    face = _ensure_face_3d(faces["front"])
+    face_size = int(face.shape[0])
+    channels = int(face.shape[2])
+    atlas = np.zeros((face_size * 2, face_size * 3, channels), dtype=face.dtype)
+    atlas[0:face_size, 0:face_size] = _ensure_face_3d(faces["left"])
+    atlas[0:face_size, face_size : 2 * face_size] = _ensure_face_3d(faces["front"])
+    atlas[0:face_size, 2 * face_size : 3 * face_size] = _ensure_face_3d(faces["right"])
+    atlas[face_size : 2 * face_size, 0:face_size] = _ensure_face_3d(faces["back"])
+    atlas[face_size : 2 * face_size, face_size : 2 * face_size] = _ensure_face_3d(faces["up"])
+    atlas[face_size : 2 * face_size, 2 * face_size : 3 * face_size] = _ensure_face_3d(faces["down"])
+    return atlas
+
+
+def _dice_from_faces(faces: Dict[str, np.ndarray]) -> np.ndarray:
+    face = _ensure_face_3d(faces["front"])
+    face_size = int(face.shape[0])
+    channels = int(face.shape[2])
+    dice = np.zeros((face_size * 3, face_size * 4, channels), dtype=face.dtype)
+
+    # Standard dice/cross layout:
+    #   [   ][ up ][   ][   ]
+    #   [left][front][right][back]
+    #   [   ][down][   ][   ]
+    dice[0:face_size, face_size : 2 * face_size] = _ensure_face_3d(faces["up"])
+    dice[face_size : 2 * face_size, 0:face_size] = _ensure_face_3d(faces["left"])
+    dice[face_size : 2 * face_size, face_size : 2 * face_size] = _ensure_face_3d(faces["front"])
+    dice[face_size : 2 * face_size, 2 * face_size : 3 * face_size] = _ensure_face_3d(faces["right"])
+    dice[face_size : 2 * face_size, 3 * face_size : 4 * face_size] = _ensure_face_3d(faces["back"])
+    dice[2 * face_size : 3 * face_size, face_size : 2 * face_size] = _ensure_face_3d(faces["down"])
+    return dice
+
+
+def _faces_from_dice(dice: np.ndarray, face_size: int) -> Dict[str, np.ndarray]:
+    return {
+        "up": dice[0:face_size, face_size : 2 * face_size],
+        "left": dice[face_size : 2 * face_size, 0:face_size],
+        "front": dice[face_size : 2 * face_size, face_size : 2 * face_size],
+        "right": dice[face_size : 2 * face_size, 2 * face_size : 3 * face_size],
+        "back": dice[face_size : 2 * face_size, 3 * face_size : 4 * face_size],
+        "down": dice[2 * face_size : 3 * face_size, face_size : 2 * face_size],
+    }
+
+
+def _horizon_from_faces(faces: Dict[str, np.ndarray], face_order: List[str]) -> np.ndarray:
+    face = _ensure_face_3d(faces["front"])
+    face_size = int(face.shape[0])
+    channels = int(face.shape[2])
+    horizon = np.zeros((face_size, face_size * 6, channels), dtype=face.dtype)
+    for idx, name in enumerate(face_order):
+        horizon[:, idx * face_size : (idx + 1) * face_size] = _ensure_face_3d(faces[name])
+    return horizon
+
+
+def _faces_from_horizon(horizon: np.ndarray, face_order: List[str]) -> Dict[str, np.ndarray]:
+    h, w = horizon.shape[:2]
+    if w % 6 != 0:
+        raise ValueError(f"Horizon cubemap width must be divisible by 6, got {w}")
+    face_size = w // 6
+    if h != face_size:
+        raise ValueError(
+            f"Horizon cubemap must have H==W/6 (faces are square), got H={h}, W={w}"
+        )
+
+    faces: Dict[str, np.ndarray] = {}
+    for idx, name in enumerate(face_order):
+        faces[name] = horizon[:, idx * face_size : (idx + 1) * face_size]
+    return faces
 
 
 class EquirectangularRotate:
@@ -782,6 +921,877 @@ class CubemapFacesExtract:
         bottom_batch = torch.stack(bottom_faces, dim=0)
 
         return (left_batch, front_batch, right_batch, back_batch, top_batch, bottom_batch)
+
+
+class EquirectangularToCubemapFlexible:
+    """ComfyUI node to convert an equirectangular image into multiple cubemap formats."""
+
+    DESCRIPTION = "Convert equirectangular panoramas into cubemaps in multiple formats (3x2 atlas, dice, horizon, stack, list, dict)."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Equirectangular input image tensor (B,H,W,C) in [0,1].",
+                    },
+                ),
+            },
+            "optional": {
+                "face_size": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 16,
+                        "max": 4096,
+                        "step": 1,
+                        "tooltip": "Resolution (pixels) per cube face.",
+                    },
+                ),
+                "cube_format": (
+                    ["atlas_3x2", "dice", "horizon", "stack", "list", "dict"],
+                    {
+                        "default": "atlas_3x2",
+                        "tooltip": "Output cubemap layout: 3x2 atlas, dice cross, horizon strip, or stack (B*6 faces). Note: list/dict are aliases of stack for ComfyUI compatibility.",
+                    },
+                ),
+                "face_order": (
+                    "STRING",
+                    {
+                        "default": "F,R,B,L,U,D",
+                        "multiline": False,
+                        "tooltip": "Face order for stack/horizon (and list/dict alias) formats. Tokens: F,R,B,L,U,D (also accepts front/right/back/left/up/down). Example: 'F,R,B,L,U,D'.",
+                    },
+                ),
+                "interpolation": (
+                    ["lanczos", "bicubic", "bilinear", "nearest"],
+                    {
+                        "default": "lanczos",
+                        "tooltip": "Resampling filter used during face generation.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("cubemap",)
+    FUNCTION = "to_cubemap_flexible"
+    CATEGORY = "LatLong/Cubemap"
+
+    def to_cubemap_flexible(
+        self,
+        image: torch.Tensor,
+        face_size: int = 512,
+        cube_format: str = "atlas_3x2",
+        face_order: str = "F,R,B,L,U,D",
+        interpolation: str = "lanczos",
+    ) -> Tuple[Any]:
+        batch_size = int(image.shape[0])
+        pbar = ProgressBar(batch_size)
+
+        order: Optional[List[str]] = None
+        if cube_format in ("horizon", "stack", "list", "dict"):
+            order = _parse_face_order(face_order)
+
+        processed_images: List[np.ndarray] = []
+        stacked_faces: List[np.ndarray] = []
+
+        for i in range(batch_size):
+            img_numpy = image[i].cpu().numpy()
+            if img_numpy.dtype != np.float32:
+                img_numpy = img_numpy.astype(np.float32)
+
+            atlas = EquirectangularProcessor.equirectangular_to_cubemap(
+                img_numpy, face_size=face_size, layout="3x2", interpolation=interpolation
+            )
+            atlas = np.clip(atlas, 0.0, 1.0).astype(np.float32)
+            faces = _faces_from_atlas_3x2(atlas, face_size)
+
+            if cube_format == "atlas_3x2":
+                processed_images.append(atlas)
+            elif cube_format == "dice":
+                processed_images.append(_dice_from_faces(faces))
+            elif cube_format == "horizon":
+                assert order is not None
+                processed_images.append(_horizon_from_faces(faces, order))
+            elif cube_format in ("stack", "list", "dict"):
+                assert order is not None
+                for name in order:
+                    stacked_faces.append(faces[name])
+            else:
+                raise ValueError(f"Unknown cube_format: {cube_format}")
+
+            pbar.update(i + 1)
+
+        if cube_format in ("stack", "list", "dict"):
+            stacked = np.stack(stacked_faces, axis=0).astype(np.float32)
+            return (torch.from_numpy(stacked),)
+
+        if cube_format in ("atlas_3x2", "dice", "horizon"):
+            result = torch.from_numpy(np.stack(processed_images, axis=0).astype(np.float32))
+            return (result,)
+
+        raise ValueError(f"Unsupported cube_format: {cube_format}")
+
+
+class CubemapToEquirectangularFlexible:
+    """ComfyUI node to convert multiple cubemap formats back to equirectangular."""
+
+    DESCRIPTION = "Convert cubemaps in multiple formats (3x2 atlas, dice, horizon, stack, list, dict) back to equirectangular."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "cubemap": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Cubemap input tensor. Use cube_format=atlas_3x2/dice/horizon for packed layouts, or stack/list/dict (alias) for face stacks (B*6 faces).",
+                    },
+                ),
+            },
+            "optional": {
+                "cube_format": (
+                    ["atlas_3x2", "dice", "horizon", "stack", "list", "dict"],
+                    {
+                        "default": "atlas_3x2",
+                        "tooltip": "How to interpret the input cubemap. Note: list/dict are aliases of stack for ComfyUI compatibility.",
+                    },
+                ),
+                "face_order": (
+                    "STRING",
+                    {
+                        "default": "F,R,B,L,U,D",
+                        "multiline": False,
+                        "tooltip": "Face order for stack/horizon (and list/dict alias) formats. Must match how the cubemap was packed.",
+                    },
+                ),
+                "output_width": (
+                    "INT",
+                    {
+                        "default": 2048,
+                        "min": 256,
+                        "max": 8192,
+                        "step": 1,
+                        "tooltip": "Width of output equirectangular panorama (typically 2x height for standard 2:1 ratio).",
+                    },
+                ),
+                "output_height": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 128,
+                        "max": 4096,
+                        "step": 1,
+                        "tooltip": "Height of output equirectangular panorama.",
+                    },
+                ),
+                "interpolation": (
+                    ["lanczos", "bicubic", "bilinear", "nearest"],
+                    {
+                        "default": "lanczos",
+                        "tooltip": "Resampling quality when mapping cubemap -> equirectangular.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("equirectangular_image",)
+    FUNCTION = "to_equirectangular_flexible"
+    CATEGORY = "LatLong/Cubemap"
+
+    def to_equirectangular_flexible(
+        self,
+        cubemap: Any,
+        cube_format: str = "atlas_3x2",
+        face_order: str = "F,R,B,L,U,D",
+        output_width: int = 2048,
+        output_height: int = 1024,
+        interpolation: str = "lanczos",
+    ) -> Tuple[torch.Tensor]:
+        order: Optional[List[str]] = None
+        if cube_format in ("horizon", "stack", "list", "dict"):
+            order = _parse_face_order(face_order)
+
+        processed_images: List[torch.Tensor] = []
+
+        if not isinstance(cubemap, torch.Tensor):
+            raise ValueError(f"Unsupported cubemap input type for cube_format={cube_format}: {type(cubemap)}")
+
+        if cube_format in ("stack", "list", "dict"):
+            assert order is not None
+            total_faces = int(cubemap.shape[0])
+            if total_faces % 6 != 0:
+                raise ValueError(f"Stack cubemap expects N faces divisible by 6, got {total_faces}")
+            num_panos = total_faces // 6
+            pbar = ProgressBar(num_panos)
+
+            for pano_idx in range(num_panos):
+                group = cubemap[pano_idx * 6 : (pano_idx + 1) * 6]  # (6,H,W,C)
+                if group.shape[1] != group.shape[2]:
+                    raise ValueError("Stack cubemap faces must be square (H==W)")
+
+                faces: Dict[str, np.ndarray] = {}
+                for idx, name in enumerate(order):
+                    face_np = group[idx].cpu().numpy()
+                    if face_np.dtype != np.float32:
+                        face_np = face_np.astype(np.float32)
+                    faces[name] = face_np
+
+                atlas = _atlas_3x2_from_faces(faces)
+                equi = EquirectangularProcessor.cubemap_to_equirectangular(
+                    atlas,
+                    output_width=output_width,
+                    output_height=output_height,
+                    layout="3x2",
+                    interpolation=interpolation,
+                )
+                equi = np.clip(equi, 0.0, 1.0).astype(np.float32)
+                processed_images.append(torch.from_numpy(equi))
+                pbar.update(pano_idx + 1)
+
+            return (torch.stack(processed_images, dim=0),)
+
+        batch_size = int(cubemap.shape[0])
+        pbar = ProgressBar(batch_size)
+
+        for i in range(batch_size):
+            cube_np = cubemap[i].cpu().numpy()
+            if cube_np.dtype != np.float32:
+                cube_np = cube_np.astype(np.float32)
+
+            if cube_format == "atlas_3x2":
+                atlas = cube_np
+            elif cube_format == "dice":
+                face_size = cube_np.shape[0] // 3
+                faces = _faces_from_dice(cube_np, face_size)
+                atlas = _atlas_3x2_from_faces(faces)
+            elif cube_format == "horizon":
+                assert order is not None
+                faces = _faces_from_horizon(cube_np, order)
+                atlas = _atlas_3x2_from_faces(faces)
+            else:
+                raise ValueError(f"Unknown cube_format: {cube_format}")
+
+            equi = EquirectangularProcessor.cubemap_to_equirectangular(
+                atlas,
+                output_width=output_width,
+                output_height=output_height,
+                layout="3x2",
+                interpolation=interpolation,
+            )
+            equi = np.clip(equi, 0.0, 1.0).astype(np.float32)
+            processed_images.append(torch.from_numpy(equi))
+            pbar.update(i + 1)
+
+        return (torch.stack(processed_images, dim=0),)
+
+
+class StackCubemapFacesNode:
+    """Stack six cubemap faces into a single face-stack tensor (B*6, H, W, C)."""
+
+    DESCRIPTION = "Stack cubemap faces into a single tensor (B*6 faces). Use with cube_format='stack'."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "Front": ("IMAGE", {"tooltip": "Front face image batch."}),
+                "Right": ("IMAGE", {"tooltip": "Right face image batch."}),
+                "Back": ("IMAGE", {"tooltip": "Back face image batch."}),
+                "Left": ("IMAGE", {"tooltip": "Left face image batch."}),
+                "Up": ("IMAGE", {"tooltip": "Up face image batch."}),
+                "Down": ("IMAGE", {"tooltip": "Down face image batch."}),
+            },
+            "optional": {
+                "face_order": (
+                    "STRING",
+                    {
+                        "default": "F,R,B,L,U,D",
+                        "multiline": False,
+                        "tooltip": "Output stack face order. Must match the order you use when converting back from stack.",
+                    },
+                )
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("face_stack",)
+    FUNCTION = "stack_faces"
+    CATEGORY = "LatLong/Cubemap"
+
+    def stack_faces(
+        self,
+        Front: torch.Tensor,
+        Right: torch.Tensor,
+        Back: torch.Tensor,
+        Left: torch.Tensor,
+        Up: torch.Tensor,
+        Down: torch.Tensor,
+        face_order: str = "F,R,B,L,U,D",
+    ) -> Tuple[torch.Tensor]:
+        order = _parse_face_order(face_order)
+        faces = {
+            "front": Front,
+            "right": Right,
+            "back": Back,
+            "left": Left,
+            "up": Up,
+            "down": Down,
+        }
+
+        # Validate shapes
+        shapes = {name: tuple(t.shape) for name, t in faces.items()}
+        batch_sizes = {shape[0] for shape in shapes.values()}
+        if len(batch_sizes) != 1:
+            raise ValueError(f"All faces must have same batch size, got: {shapes}")
+
+        b, h, w, c = Front.shape
+        for name, t in faces.items():
+            if tuple(t.shape) != (b, h, w, c):
+                raise ValueError(f"All faces must match shape (B,H,W,C); {name} got {tuple(t.shape)} vs {(b,h,w,c)}")
+
+        stacked: List[torch.Tensor] = []
+        for i in range(b):
+            for name in order:
+                stacked.append(faces[name][i])
+
+        return (torch.stack(stacked, dim=0),)
+
+
+class SplitCubemapFacesNode:
+    """Split a face-stack tensor (B*6, H, W, C) into six face batches (B, H, W, C)."""
+
+    DESCRIPTION = "Split a cubemap face-stack into six face batches. Supports any stack face order."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "face_stack": ("IMAGE", {"tooltip": "Stacked cubemap faces (B*6, H, W, C)."}),
+            },
+            "optional": {
+                "face_order": (
+                    "STRING",
+                    {
+                        "default": "F,R,B,L,U,D",
+                        "multiline": False,
+                        "tooltip": "Input stack face order. Must match how the stack was created.",
+                    },
+                )
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("Front", "Right", "Back", "Left", "Up", "Down")
+    FUNCTION = "split_faces"
+    CATEGORY = "LatLong/Cubemap"
+
+    def split_faces(
+        self, face_stack: torch.Tensor, face_order: str = "F,R,B,L,U,D"
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        order = _parse_face_order(face_order)
+        total_faces = int(face_stack.shape[0])
+        if total_faces % 6 != 0:
+            raise ValueError(f"face_stack first dim must be divisible by 6, got {total_faces}")
+        batch_size = total_faces // 6
+
+        # For each panorama, pick the face at the correct position in the stack.
+        def gather_face(face_name: str) -> torch.Tensor:
+            idx_in_stack = order.index(face_name)
+            gathered = [face_stack[i * 6 + idx_in_stack] for i in range(batch_size)]
+            return torch.stack(gathered, dim=0)
+
+        front = gather_face("front")
+        right = gather_face("right")
+        back = gather_face("back")
+        left = gather_face("left")
+        up = gather_face("up")
+        down = gather_face("down")
+        return (front, right, back, left, up, down)
+
+
+def _create_center_seam_mask(
+    x: torch.Tensor, frac_width: float = 0.10, pixel_width: int = 0, feather: int = 0
+) -> torch.Tensor:
+    """Create a vertical seam mask centered in the image (BHWC input -> BHW mask)."""
+    b, h, w, *_ = x.shape
+
+    if pixel_width > 0:
+        strip = int(pixel_width)
+    else:
+        strip = max(1, int(w * float(frac_width)))
+
+    strip = max(1, min(strip, w))
+    x0 = (w - strip) // 2
+    x1 = x0 + strip
+
+    mask = torch.zeros((b, h, w), dtype=x.dtype, device=x.device)
+    if feather <= 0:
+        mask[:, :, x0:x1] = 1.0
+        return mask
+
+    feather = int(feather)
+
+    # Left feather
+    left_start = max(0, x0 - feather)
+    left_end = x0
+    if left_end > left_start:
+        steps = torch.linspace(
+            0.0,
+            1.0,
+            left_end - left_start,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        mask[:, :, left_start:left_end] = steps[None, None, :]
+
+    # Center strip
+    mask[:, :, x0:x1] = 1.0
+
+    # Right feather
+    right_start = x1
+    right_end = min(w, x1 + feather)
+    if right_end > right_start:
+        steps = torch.linspace(
+            1.0,
+            0.0,
+            right_end - right_start,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        mask[:, :, right_start:right_end] = steps[None, None, :]
+
+    return mask
+
+
+def _circle_mask_np(
+    size: int, circle_radius: float, pixel_radius: int = 0, feather: int = 0
+) -> np.ndarray:
+    """Create a centered circular mask in a square array, values in [0,1]."""
+    size = int(size)
+    if size < 1:
+        raise ValueError("size must be >= 1")
+
+    max_radius = size / 2.0
+    inner_radius = float(pixel_radius) if pixel_radius > 0 else float(circle_radius) * max_radius
+    feather = int(feather)
+    outer_radius = inner_radius + float(max(0, feather))
+
+    yy, xx = np.ogrid[:size, :size]
+    center = (size - 1) / 2.0
+    dist = np.sqrt((xx - center) ** 2 + (yy - center) ** 2)
+
+    mask = np.zeros((size, size), dtype=np.float32)
+    mask[dist <= inner_radius] = 1.0
+
+    if feather > 0:
+        zone = (dist > inner_radius) & (dist <= outer_radius)
+        mask[zone] = 1.0 - (dist[zone] - inner_radius) / float(feather)
+
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
+
+
+class LatLongCreateSeamMask:
+    """Create a seam mask for inpainting equirectangular seams."""
+
+    DESCRIPTION = "Create a centered vertical seam mask (optionally feathered). Useful with Roll Image for seam inpainting."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Reference image (B,H,W,C) used to size the mask."}),
+            },
+            "optional": {
+                "frac_width": (
+                    "FLOAT",
+                    {
+                        "default": 0.10,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Fraction of image width for the seam strip (ignored if pixel_width > 0).",
+                    },
+                ),
+                "pixel_width": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 8192,
+                        "step": 1,
+                        "tooltip": "Explicit seam width in pixels (overrides frac_width if > 0).",
+                    },
+                ),
+                "feather": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 2048,
+                        "step": 1,
+                        "tooltip": "Feather width in pixels on both sides of the seam.",
+                    },
+                ),
+                "roll_x_by_50_percent": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Shift the mask horizontally by 50% (useful if you rolled the image by 180°).",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("seam_mask",)
+    FUNCTION = "run"
+    CATEGORY = "LatLong/Mask"
+
+    def run(
+        self,
+        image: torch.Tensor,
+        frac_width: float = 0.10,
+        pixel_width: int = 0,
+        feather: int = 0,
+        roll_x_by_50_percent: bool = False,
+    ) -> Tuple[torch.Tensor]:
+        if image.dim() != 4:
+            raise ValueError(f"Expected IMAGE (B,H,W,C), got shape {tuple(image.shape)}")
+        mask = _create_center_seam_mask(
+            image, frac_width=frac_width, pixel_width=pixel_width, feather=feather
+        )
+        if roll_x_by_50_percent:
+            shift = int(image.shape[2]) // 2
+            mask = torch.roll(mask, shifts=(0, shift), dims=(1, 2))
+        return (mask,)
+
+
+class LatLongCreatePoleMask:
+    """Create a pole mask for inpainting poles on cubemap faces or equirectangular panoramas."""
+
+    DESCRIPTION = "Create a circular pole mask. Mode 'face' outputs a centered circle mask on a face. Mode 'equirectangular' maps circles on Up/Down cube faces back to equirectangular."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Reference IMAGE (face or equirectangular) used to size the mask."}),
+                "circle_radius": (
+                    "FLOAT",
+                    {
+                        "default": 0.10,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Circle radius as a fraction of the max possible radius (min(H,W)/2). Ignored if pixel_radius > 0.",
+                    },
+                ),
+                "pixel_radius": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 8192,
+                        "step": 1,
+                        "tooltip": "Circle radius in pixels (overrides circle_radius if > 0).",
+                    },
+                ),
+                "feather": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 4096,
+                        "step": 1,
+                        "tooltip": "Feather width in pixels.",
+                    },
+                ),
+                "mode": (
+                    ["face", "equirectangular"],
+                    {
+                        "default": "face",
+                        "tooltip": "face: mask matches input face dimensions. equirectangular: creates masks on Up/Down cube faces then maps back to equirectangular.",
+                    },
+                ),
+            },
+            "optional": {
+                "face_size": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": -1,
+                        "max": 4096,
+                        "step": 1,
+                        "tooltip": "Only used for mode=equirectangular. Cubemap face size to generate the pole mask. Set to -1 for auto (H//2).",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("pole_mask",)
+    FUNCTION = "run"
+    CATEGORY = "LatLong/Mask"
+
+    def run(
+        self,
+        image: torch.Tensor,
+        circle_radius: float = 0.10,
+        pixel_radius: int = 0,
+        feather: int = 0,
+        mode: str = "face",
+        face_size: int = 512,
+    ) -> Tuple[torch.Tensor]:
+        if image.dim() != 4:
+            raise ValueError(f"Expected IMAGE (B,H,W,C), got shape {tuple(image.shape)}")
+
+        b, h, w, _ = image.shape
+
+        if mode == "face":
+            if h != w:
+                raise ValueError(f"face mode expects square faces (H==W), got H={h}, W={w}")
+            mask_2d = _circle_mask_np(
+                size=h, circle_radius=circle_radius, pixel_radius=pixel_radius, feather=feather
+            )
+            mask = torch.from_numpy(mask_2d).to(dtype=image.dtype, device=image.device)
+            return (mask.unsqueeze(0).repeat(b, 1, 1),)
+
+        # mode == "equirectangular"
+        fs = int(face_size) if int(face_size) > 0 else max(16, int(h) // 2)
+        circle = _circle_mask_np(
+            size=fs, circle_radius=circle_radius, pixel_radius=pixel_radius, feather=feather
+        )
+        faces = {
+            "front": np.zeros((fs, fs), dtype=np.float32),
+            "right": np.zeros((fs, fs), dtype=np.float32),
+            "back": np.zeros((fs, fs), dtype=np.float32),
+            "left": np.zeros((fs, fs), dtype=np.float32),
+            "up": circle,
+            "down": circle,
+        }
+        atlas = _atlas_3x2_from_faces(faces).astype(np.float32)
+        pole_mask = EquirectangularProcessor.cubemap_to_equirectangular(
+            atlas,
+            output_width=int(w),
+            output_height=int(h),
+            layout="3x2",
+            interpolation="bilinear",
+        )
+        pole_mask = np.clip(pole_mask[..., 0], 0.0, 1.0).astype(np.float32)
+        mask_t = torch.from_numpy(pole_mask).to(dtype=image.dtype)
+        return (mask_t.unsqueeze(0).repeat(b, 1, 1),)
+
+
+class LatLongRollImage:
+    """Roll an IMAGE tensor along x/y axes without resampling."""
+
+    DESCRIPTION = "Roll an image along width/height (wraparound). Useful for moving the seam to the center before inpainting."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"image": ("IMAGE", {"tooltip": "Image batch (B,H,W,C) to roll."})},
+            "optional": {
+                "roll_x": (
+                    "INT",
+                    {"default": 0, "min": -8192, "max": 8192, "step": 1, "tooltip": "Horizontal roll (pixels)."},
+                ),
+                "roll_y": (
+                    "INT",
+                    {"default": 0, "min": -8192, "max": 8192, "step": 1, "tooltip": "Vertical roll (pixels)."},
+                ),
+                "roll_x_by_50_percent": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Set roll_x to half the image width (180° equirectangular shift). Overrides roll_x/roll_y.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("rolled_image",)
+    FUNCTION = "roll"
+    CATEGORY = "LatLong/Utils"
+
+    def roll(
+        self, image: torch.Tensor, roll_x: int = 0, roll_y: int = 0, roll_x_by_50_percent: bool = False
+    ) -> Tuple[torch.Tensor]:
+        if roll_x_by_50_percent:
+            roll_x = int(image.shape[2]) // 2
+            roll_y = 0
+        return (torch.roll(image, shifts=(int(roll_y), int(roll_x)), dims=(1, 2)),)
+
+
+class LatLongRollMask:
+    """Roll a MASK tensor along x/y axes."""
+
+    DESCRIPTION = "Roll a mask along width/height (wraparound). Useful with seam masks and roll workflows."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"mask": ("MASK", {"tooltip": "Mask batch (B,H,W) to roll."})},
+            "optional": {
+                "roll_x": (
+                    "INT",
+                    {"default": 0, "min": -8192, "max": 8192, "step": 1, "tooltip": "Horizontal roll (pixels)."},
+                ),
+                "roll_y": (
+                    "INT",
+                    {"default": 0, "min": -8192, "max": 8192, "step": 1, "tooltip": "Vertical roll (pixels)."},
+                ),
+                "roll_x_by_50_percent": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Set roll_x to half the mask width. Overrides roll_x/roll_y.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("rolled_mask",)
+    FUNCTION = "roll"
+    CATEGORY = "LatLong/Utils"
+
+    def roll(
+        self, mask: torch.Tensor, roll_x: int = 0, roll_y: int = 0, roll_x_by_50_percent: bool = False
+    ) -> Tuple[torch.Tensor]:
+        if mask.dim() != 3:
+            raise ValueError(f"Expected MASK (B,H,W), got shape {tuple(mask.shape)}")
+        if roll_x_by_50_percent:
+            roll_x = int(mask.shape[2]) // 2
+            roll_y = 0
+        return (torch.roll(mask, shifts=(int(roll_y), int(roll_x)), dims=(1, 2)),)
+
+
+def _conv_forward_circular_x(
+    self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    x = torch.nn.functional.pad(x, self.padding_values_x, mode="circular")
+    x = torch.nn.functional.pad(x, self.padding_values_y, mode="constant")
+    return torch.nn.functional.conv2d(
+        x, weight, bias, self.stride, (0, 0), self.dilation, self.groups
+    )
+
+
+def _apply_circular_conv2d_padding(
+    model: torch.nn.Module, is_vae: bool = False, x_axis_only: bool = True
+) -> torch.nn.Module:
+    modules = model.first_stage_model.modules() if is_vae else model.modules()
+    for layer in modules:
+        if isinstance(layer, torch.nn.Conv2d):
+            if x_axis_only:
+                layer.padding_values_x = (
+                    layer._reversed_padding_repeated_twice[0],
+                    layer._reversed_padding_repeated_twice[1],
+                    0,
+                    0,
+                )
+                layer.padding_values_y = (
+                    0,
+                    0,
+                    layer._reversed_padding_repeated_twice[2],
+                    layer._reversed_padding_repeated_twice[3],
+                )
+                layer._conv_forward = _conv_forward_circular_x.__get__(layer, torch.nn.Conv2d)
+            else:
+                layer.padding_mode = "circular"
+    return model
+
+
+class LatLongApplyCircularConvPaddingModel:
+    """Apply circular padding to Conv2d layers in a ComfyUI MODEL to reduce seam artifacts."""
+
+    DESCRIPTION = "Apply circular padding to MODEL Conv2d layers (x-axis only by default) for seam-safe generation."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (
+                    "MODEL",
+                    {"tooltip": "Model to add circular x-axis Conv2d padding to."},
+                ),
+                "inplace": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Modify the loaded model (True) or a copy (False). If True, reload model to restore original padding.",
+                    },
+                ),
+                "x_axis_only": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply circular padding only on x-axis (recommended for equirectangular seams) or on both axes.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "run"
+    CATEGORY = "LatLong/Models"
+
+    def run(
+        self, model: torch.nn.Module, inplace: bool = True, x_axis_only: bool = True
+    ) -> Tuple[torch.nn.Module]:
+        use_model = model if inplace else copy.deepcopy(model)
+        _apply_circular_conv2d_padding(use_model.model, is_vae=False, x_axis_only=x_axis_only)
+        return (use_model,)
+
+
+class LatLongApplyCircularConvPaddingVAE:
+    """Apply circular padding to Conv2d layers in a ComfyUI VAE to reduce seam artifacts."""
+
+    DESCRIPTION = "Apply circular padding to VAE Conv2d layers (x-axis only by default) for seam-safe generation."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": (
+                    "VAE",
+                    {"tooltip": "VAE to add circular x-axis Conv2d padding to."},
+                ),
+                "inplace": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Modify the loaded VAE (True) or a copy (False). If True, reload VAE to restore original padding.",
+                    },
+                ),
+                "x_axis_only": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply circular padding only on x-axis (recommended) or on both axes.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("VAE",)
+    RETURN_NAMES = ("vae",)
+    FUNCTION = "run"
+    CATEGORY = "LatLong/Models"
+
+    def run(
+        self, vae: torch.nn.Module, inplace: bool = True, x_axis_only: bool = True
+    ) -> Tuple[torch.nn.Module]:
+        use_vae = vae if inplace else copy.deepcopy(vae)
+        _apply_circular_conv2d_padding(use_vae, is_vae=True, x_axis_only=x_axis_only)
+        return (use_vae,)
 
 
 class PanoramaViewerNode:

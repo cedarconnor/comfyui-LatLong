@@ -45,6 +45,9 @@ Requirements
 GPU Notes
 - Some GPU paths use `torch.grid_sample` and support bilinear/nearest only. Lanczos/Bicubic use CPU (OpenCV) paths.
 
+Viewer Notes
+- The interactive panorama preview nodes use Three.js. If you are offline or your frontend blocks CDN imports, run `python install.py` to download Three.js into `js/lib/`.
+
 ## Nodes Overview
 
 ### Core Transformation Nodes
@@ -114,6 +117,11 @@ GPU Notes
 - Inputs: `image`, `face_size`, `interpolation`
 - Useful for: Processing individual faces, creating custom cubemap layouts
 
+**Flexible Cubemap Formats (Advanced)**
+- **Equirectangular To Cubemap (Flexible)**: Output cubemaps as `atlas_3x2`, `dice`, `horizon`, or `stack` with configurable `face_order` (note: `list`/`dict` are aliases of `stack` for ComfyUI compatibility).
+- **Cubemap To Equirectangular (Flexible)**: Ingest the same formats and convert back to equirectangular.
+- **Stack Cubemap Faces (Stack)** / **Split Cubemap Faces (Stack)**: Pack/unpack face stacks (B*6 faces) for seam-edit workflows.
+
 ### Utility Nodes
 
 10) **Equirectangular Mirror/Flip**
@@ -127,6 +135,13 @@ GPU Notes
 - Purpose: Resize equirectangular images with aspect ratio preservation.
 - Inputs: `image`, `output_width`, `output_height`, `maintain_aspect`, `interpolation`
 - Features: Auto-maintains 2:1 aspect ratio (standard equirectangular) or custom dimensions
+
+### Seam-Safe / Mask Nodes
+
+- **Create Seam Mask**: Center seam mask (with optional feather + optional 50% roll offset).
+- **Create Pole Mask**: Circle mask for poles (face or equirectangular mode).
+- **Roll Image (Wrap)** / **Roll Mask (Wrap)**: Fast wraparound rolling without resampling.
+- **Apply Circular Padding Model/VAE**: Adds circular x-axis Conv2d padding to reduce seam artifacts (reload to undo if applied inplace).
 
 ### Post-Processing Nodes
 
@@ -190,6 +205,9 @@ GPU Notes
 **Cubemap Conversion**
 - Generate cubemap with Equirectangular → Cubemap, then convert back with Cubemap → Equirectangular for round-trip workflows.
 
+**Flexible Cubemap Formats**
+- Use Equirectangular To Cubemap (Flexible) with `cube_format` = `dice` (cross), `horizon` (strip), or `stack` (B*6 faces). Convert back with Cubemap To Equirectangular (Flexible).
+
 **Extract Individual Faces**
 - Add Cubemap Faces Extract to get 6 separate images (left, front, right, back, top, bottom) from an equirectangular panorama.
 
@@ -213,6 +231,12 @@ GPU Notes
 
 **Edge Blending for Seamless Wraparound**
 - Add Equirectangular Edge Blender after rotation/processing, set `blend_width` to 10-20, choose "cosine" mode, enable continuity check to validate seamless edges.
+
+**Seam Inpainting Workflow**
+- Roll Image (Wrap) (50% x-roll)  Create Seam Mask  inpaint/composite  Roll Image (Wrap) back  (optional) Equirectangular Edge Blender.
+
+**Seam-Safe Generation**
+- Apply Circular Padding Model/VAE before sampling/decoding to reduce x-seam artifacts (reload model/vae to undo if applied inplace).
 
 ## Technical Notes
 

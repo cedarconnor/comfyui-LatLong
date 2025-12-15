@@ -132,12 +132,103 @@ def run_tests():
     assert out_cube.shape[1] == 64*2 and out_cube.shape[2] == 64*3
     assert_range01(out_cube.numpy(), 'cubemap')
 
+    # Cubemap (flexible) -> stack -> back to equirectangular
+    to_cube_flex = nodes.EquirectangularToCubemapFlexible()
+    cube_stack, = to_cube_flex.to_cubemap_flexible(
+        batch, face_size=64, cube_format="stack", face_order="F,R,B,L,U,D", interpolation="bilinear"
+    )
+    assert cube_stack.shape[0] == batch.shape[0] * 6
+    assert cube_stack.shape[1] == 64 and cube_stack.shape[2] == 64
+    assert_range01(cube_stack.numpy(), "cubemap_stack")
+
+    to_equi_flex = nodes.CubemapToEquirectangularFlexible()
+    equi_from_stack, = to_equi_flex.to_equirectangular_flexible(
+        cube_stack,
+        cube_format="stack",
+        face_order="F,R,B,L,U,D",
+        output_width=batch.shape[2],
+        output_height=batch.shape[1],
+        interpolation="bilinear",
+    )
+    assert equi_from_stack.shape == batch.shape
+    assert_range01(equi_from_stack.numpy(), "equi_from_stack")
+
+    # Dice layout round-trip
+    cube_dice, = to_cube_flex.to_cubemap_flexible(
+        batch, face_size=64, cube_format="dice", interpolation="nearest"
+    )
+    assert cube_dice.shape[1] == 64 * 3 and cube_dice.shape[2] == 64 * 4
+    equi_from_dice, = to_equi_flex.to_equirectangular_flexible(
+        cube_dice,
+        cube_format="dice",
+        output_width=batch.shape[2],
+        output_height=batch.shape[1],
+        interpolation="bilinear",
+    )
+    assert equi_from_dice.shape == batch.shape
+    assert_range01(equi_from_dice.numpy(), "equi_from_dice")
+
+    # Horizon layout round-trip
+    cube_horizon, = to_cube_flex.to_cubemap_flexible(
+        batch,
+        face_size=64,
+        cube_format="horizon",
+        face_order="F,R,B,L,U,D",
+        interpolation="bilinear",
+    )
+    assert cube_horizon.shape[1] == 64 and cube_horizon.shape[2] == 64 * 6
+    equi_from_horizon, = to_equi_flex.to_equirectangular_flexible(
+        cube_horizon,
+        cube_format="horizon",
+        face_order="F,R,B,L,U,D",
+        output_width=batch.shape[2],
+        output_height=batch.shape[1],
+        interpolation="bilinear",
+    )
+    assert equi_from_horizon.shape == batch.shape
+    assert_range01(equi_from_horizon.numpy(), "equi_from_horizon")
+
+    # Stack/split utilities
+    split_stack = nodes.SplitCubemapFacesNode()
+    f, r, b, l, u, d = split_stack.split_faces(cube_stack, face_order="F,R,B,L,U,D")
+    assert f.shape[0] == batch.shape[0] and f.shape[1] == 64 and f.shape[2] == 64
+
+    stack_faces = nodes.StackCubemapFacesNode()
+    cube_stack2, = stack_faces.stack_faces(
+        f, r, b, l, u, d, face_order="F,R,B,L,U,D"
+    )
+    assert cube_stack2.shape == cube_stack.shape
+
     # Combined processor basics
     comb = nodes.EquirectangularProcessor_Combined()
     out_comb, = comb.process_equirectangular(batch, yaw_rotation=0.0, pitch_rotation=0.0, roll_rotation=0.0, horizon_offset=0.0, crop_to_180=False, crop_to_square=True, output_width=512, output_height=256, interpolation='bilinear')
     h, w = out_comb.shape[1:3]
     assert h == w, 'square crop expected'
     assert_range01(out_comb.numpy(), 'combined_square')
+
+    # Seam mask + roll utilities
+    seam = nodes.LatLongCreateSeamMask()
+    seam_mask, = seam.run(batch, frac_width=0.1, pixel_width=0, feather=8, roll_x_by_50_percent=False)
+    assert seam_mask.shape == (batch.shape[0], batch.shape[1], batch.shape[2])
+    assert_range01(seam_mask.numpy(), "seam_mask")
+
+    roll_img = nodes.LatLongRollImage()
+    rolled_img, = roll_img.roll(batch, roll_x_by_50_percent=True)
+    assert rolled_img.shape == batch.shape
+
+    roll_mask = nodes.LatLongRollMask()
+    rolled_mask, = roll_mask.roll(seam_mask, roll_x_by_50_percent=True)
+    assert rolled_mask.shape == seam_mask.shape
+
+    # Pole mask (face + equirectangular)
+    pole = nodes.LatLongCreatePoleMask()
+    pole_face_mask, = pole.run(f, circle_radius=0.25, pixel_radius=0, feather=4, mode="face")
+    assert pole_face_mask.shape == (batch.shape[0], 64, 64)
+    assert_range01(pole_face_mask.numpy(), "pole_face_mask")
+
+    pole_equi_mask, = pole.run(batch, circle_radius=0.25, pixel_radius=0, feather=4, mode="equirectangular", face_size=64)
+    assert pole_equi_mask.shape == (batch.shape[0], batch.shape[1], batch.shape[2])
+    assert_range01(pole_equi_mask.numpy(), "pole_equi_mask")
 
     print('All node smoke tests passed.')
 

@@ -1,0 +1,9 @@
+If the 360 panorama viewer shows a blank/black widget, install Three.js:
+
+Option A (recommended):
+- Run `python install.py` from the root of this extension.
+
+Option B:
+- Download `three.core.min.js` and `three.module.min.js` (same Three.js version),
+  and place them in this folder (`js/lib/`).
+
