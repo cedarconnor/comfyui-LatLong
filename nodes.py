@@ -11,6 +11,7 @@ from comfy.utils import ProgressBar
 from PIL import Image
 
 from .modules.equirectangular_processor import EquirectangularProcessor
+import math
 
 
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2157,3 +2158,494 @@ class EquirectangularEdgeBlender:
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
+
+# ============================================================================
+# Outpaint Nodes
+# ============================================================================
+
+def _create_inner_feather_mask(width: int, height: int, feather: int) -> torch.Tensor:
+    """Create a rectangular mask (H,W) with an inner feather gradient."""
+    # Create coordinate grids
+    y = torch.arange(height, dtype=torch.float32)
+    x = torch.arange(width, dtype=torch.float32)
+    
+    # Distance from nearest edge
+    dist_x = torch.min(x, width - 1 - x)
+    dist_y = torch.min(y, height - 1 - y)
+    
+    # Feather falloff
+    mask_x = torch.clamp(dist_x / max(1, feather), 0, 1) if feather > 0 else (dist_x >= 0).float()
+    mask_y = torch.clamp(dist_y / max(1, feather), 0, 1) if feather > 0 else (dist_y >= 0).float()
+    
+    # Combine (H, W)
+    mask = mask_y.unsqueeze(1) * mask_x.unsqueeze(0)
+    return mask
+
+def _perspective_insert(
+    flat_image: torch.Tensor,
+    canvas_h: int, canvas_w: int,
+    yaw: float, pitch: float, roll: float,
+    fov_deg: float,
+    feather: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Project a flat image onto an equirectangular canvas.
+    Inverse of perspective_extract.
+    
+    Args:
+        flat_image: (C, H_src, W_src)
+        canvas_h, canvas_w: Output dimensions
+        yaw, pitch, roll: Camera rotation (degrees)
+        fov_deg: Horizontal Field of View of the flat image
+        feather: Inner feather pixels (relative to flat image source coords)
+        
+    Returns:
+        (canvas_image (C,H,W), mask (1,H,W))
+    """
+    device = flat_image.device
+    C, H_src, W_src = flat_image.shape
+    
+    # 1. Create grid for Canvas (Equirectangular)
+    ys = torch.linspace(0, canvas_h - 1, canvas_h, device=device)
+    xs = torch.linspace(0, canvas_w - 1, canvas_w, device=device)
+    yg, xg = torch.meshgrid(ys, xs, indexing='ij') # (H, W)
+    
+    # Equirect -> Spherical (lat, lon)
+    lon = (xg / canvas_w) * (2 * math.pi) - math.pi
+    lat = (math.pi / 2) - (yg / canvas_h) * math.pi
+    
+    # Spherical -> Cartesian (world direction vectors)
+    cos_lat = torch.cos(lat)
+    x_world = cos_lat * torch.cos(lon)
+    y_world = cos_lat * torch.sin(lon)
+    z_world = torch.sin(lat)
+    
+    # Stack to (H, W, 3)
+    xyz_world = torch.stack([x_world, y_world, z_world], dim=-1)
+    
+    # 2. Rotate World -> Camera (Inverse Rotation)
+    # We use the existing rotation matrix function but need to apply it inversely.
+    # The processor's matrix transforms P_camera -> P_world.
+    # So P_camera = P_world * R (since it uses row vectors x matrix_T)
+    # Wait, check EquirectangularProcessor.create_rotation_matrix usage:
+    # rotated_points = points_flat @ rotation_matrix.T
+    # This implies rotation_matrix maps source -> dest.
+    # For perspective extract: Camera Ray (canonical) -> Rotated Ray (world)
+    # So R maps Camera -> World.
+    # Here we want World -> Camera. So we need inverse of R (which is R.T).
+    
+    R = EquirectangularProcessor._torch_rotation_matrix(yaw, pitch, roll, device, torch.float32)
+    # xyz_cam = xyz_world @ R (since R maps Cam->World, R.T maps World->Cam)
+    # Note: P @ R.T is "apply rotation vector". 
+    # If R is Cam->World, then P_world = P_cam @ R.T (standard row-vector multiplication)
+    # So P_cam = P_world @ (R.T)^-1 = P_world @ R
+    xyz_cam = torch.tensordot(xyz_world, R, dims=1) # (H, W, 3)
+    
+    x_c, y_c, z_c = xyz_cam[..., 0], xyz_cam[..., 1], xyz_cam[..., 2]
+    
+    # 3. Project Camera -> Flat Image Plane
+    # Canonical camera looks usually down +Z or +X. 
+    # In processor.perspective_extract:
+    # x_cam = (u - cx) / f
+    # y_cam = (v - cy) / f
+    # z_cam = 1
+    # This implies camera looks down +Z.
+    
+    # We need to filter points behind the camera
+    valid_mask = z_c > 0
+    
+    # Perspective projection
+    # u_norm = x_c / z_c, v_norm = y_c / z_c
+    # But we need to handle numerical stability.
+    z_c = torch.clamp(z_c, min=1e-6)
+    u_norm = x_c / z_c
+    v_norm = y_c / z_c
+    
+    # 4. Convert to Pixel Coords
+    # f = W / (2 * tan(fov/2))
+    # We can normalize coordinates to [-1, 1] range first to use grid_sample
+    
+    # f_norm (relative to width/2) = 1.0 / tan(fov/2)
+    tan_half_fov = math.tan(math.radians(fov_deg) / 2.0)
+    
+    # For canonical grid [-1, 1]:
+    # x = u_norm * (f contribution). 
+    # Let's map directly to grid coords [-1, 1] for grid_sample.
+    # Horizontal: -1 is left edge, +1 is right edge of flat image.
+    # Ray at edge: x/z = tan(fov/2)
+    # So grid_x = (x/z) / tan(fov/2)
+    grid_x = u_norm / tan_half_fov
+    
+    # Vertical: assume square pixels, so scale by aspect ratio
+    aspect = W_src / H_src
+    # grid_y = (y/z) / (tan(fov/2) / aspect)
+    grid_y = v_norm / (tan_half_fov / aspect)
+    
+    # Update valid mask to only include points within the flat image
+    valid_mask = valid_mask & (grid_x >= -1.0) & (grid_x <= 1.0) & (grid_y >= -1.0) & (grid_y <= 1.0)
+    
+    # 5. Sample from Flat Image using grid_sample
+    # grid needs to be (N, H_out, W_out, 2)
+    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0) # (1, H, W, 2)
+    
+    # Input image needs to be (N, C, H, W)
+    img_batch = flat_image.unsqueeze(0)
+    
+    sampled = torch.nn.functional.grid_sample(img_batch, grid, align_corners=True, padding_mode="zeros")
+    sampled = sampled.squeeze(0) # (C, H, W)
+    
+    # 6. Apply Feathering
+    # We can compute feather in grid space
+    if feather > 0:
+        # Check distance from edges in pixel space approx
+        # Convert grid [-1, 1] to [0, W]
+        # dist_left = (grid_x - (-1)) -> ranges 0..2
+        # pixel_dist = (grid_x + 1)/2 * W
+        
+        # Simpler: feather in normalized device coordinates (NDC)
+        # NDC width = 2.0. Pixel width = W.
+        # feather_ndc_x = feather / W * 2.0
+        feather_ndc_x = (feather / W_src) * 2.0
+        feather_ndc_y = (feather / H_src) * 2.0
+        
+        # Dist from nearest edge in NDC
+        dist_x = 1.0 - torch.abs(grid_x)
+        dist_y = 1.0 - torch.abs(grid_y)
+        
+        alpha_x = torch.clamp(dist_x / max(1e-6, feather_ndc_x), 0, 1)
+        alpha_y = torch.clamp(dist_y / max(1e-6, feather_ndc_y), 0, 1)
+        
+        feather_mask = alpha_x * alpha_y
+        valid_mask = valid_mask & (feather_mask > 0)
+        # We'll multiply the mask later
+    else:
+        feather_mask = torch.ones_like(grid_x)
+
+    # 7. Compose Final Mask
+    # valid_mask is boolean (H, W).
+    final_mask = valid_mask.float() * feather_mask
+    
+    # Zero out invalid areas in sampled image
+    sampled = sampled * valid_mask.float().unsqueeze(0)
+    
+    return sampled, final_mask.unsqueeze(0) # (C,H,W), (1,H,W)
+
+
+class LatLongOutpaintSetup:
+    """Setup node for LatLong outpainting workflow."""
+    
+    DESCRIPTION = "Place a flat image onto a transparent equirectangular canvas for outpainting."
+    CATEGORY = "LatLong/Outpaint"
+    RETURN_TYPES = ("IMAGE", "MASK", "STITCH_CONTEXT")
+    RETURN_NAMES = ("composite_image", "outpaint_mask", "stitch_context")
+    FUNCTION = "setup"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "flat_image": ("IMAGE", {"tooltip": "Source rectilinear image to place."}),
+                "canvas_width": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 8, "tooltip": "Width of the equirectangular canvas."}),
+                "canvas_height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8, "tooltip": "Height of the equirectangular canvas."}),
+                "placement_mode": (["2d_composite", "perspective"], {"default": "2d_composite"}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "2D: Pixel scale. Perspective: FOV multiplier."}),
+                "translate_x": ("INT", {"default": 0, "min": -4096, "max": 4096, "step": 1, "tooltip": "2D only: Horizontal pixel offset."}),
+                "translate_y": ("INT", {"default": 0, "min": -4096, "max": 4096, "step": 1, "tooltip": "2D only: Vertical pixel offset."}),
+                "yaw": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Perspective only: Horizontal view angle."}),
+                "pitch": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0, "tooltip": "Perspective only: Vertical view angle."}),
+                "fov": ("FLOAT", {"default": 90.0, "min": 10.0, "max": 170.0, "step": 1.0, "tooltip": "Perspective only: Base Field of View."}),
+                "feather_size": ("INT", {"default": 50, "min": 0, "max": 500, "step": 1, "tooltip": "Inner feathering in pixels."}),
+            }
+        }
+
+    def setup(self, flat_image, canvas_width, canvas_height, placement_mode, scale, translate_x, translate_y, yaw, pitch, fov, feather_size):
+        # Force 2:1 aspect ratio if requested or just use inputs? User said "force 2x1".
+        # We will force height = width // 2
+        canvas_height = canvas_width // 2
+        
+        N, H, W, C = flat_image.shape
+        device = flat_image.device
+        
+        # Prepare batch outputs
+        out_images = []
+        out_masks = []
+        
+        # Store context (assuming N=1 for context simplicity, or list of contexts)
+        # We'll store standard python objects
+        context = {
+            "placement_mode": placement_mode,
+            "original_image": flat_image, # Keep tensor on device
+            "scale": scale,
+            "translate_x": translate_x,
+            "translate_y": translate_y,
+            "yaw": yaw,
+            "pitch": pitch,
+            "fov": fov,
+            "feather_size": feather_size,
+            "setup_canvas_width": canvas_width,
+            "setup_canvas_height": canvas_height
+        }
+        
+        for i in range(N):
+            img = flat_image[i].permute(2, 0, 1) # (C, H, W)
+            
+            if placement_mode == "2d_composite":
+                # Create empty canvas
+                canvas = torch.zeros((C, canvas_height, canvas_width), device=device, dtype=torch.float32)
+                alpha = torch.zeros((1, canvas_height, canvas_width), device=device, dtype=torch.float32)
+                
+                # Calculate scaled dimensions
+                new_w = int(W * scale)
+                new_h = int(H * scale)
+                
+                if new_w > 0 and new_h > 0:
+                    # Resize source
+                    # Add batch dim for interpolate
+                    img_batch = img.unsqueeze(0)
+                    scaled_img = torch.nn.functional.interpolate(img_batch, size=(new_h, new_w), mode='bilinear', align_corners=False).squeeze(0)
+                    
+                    # Create mask with feather
+                    mask_small = _create_inner_feather_mask(new_w, new_h, feather_size).to(device)
+                    
+                    # Calculate placement
+                    # Center
+                    cx = canvas_width // 2
+                    cy = canvas_height // 2
+                    
+                    # Top-left w.r.t center, plus offset
+                    tl_x = cx - (new_w // 2) + translate_x
+                    tl_y = cy - (new_h // 2) + translate_y
+                    
+                    # Clip to canvas bounds
+                    x_start = max(0, tl_x)
+                    y_start = max(0, tl_y)
+                    x_end = min(canvas_width, tl_x + new_w)
+                    y_end = min(canvas_height, tl_y + new_h)
+                    
+                    # Source offsets
+                    src_x = x_start - tl_x
+                    src_y = y_start - tl_y
+                    w_slice = x_end - x_start
+                    h_slice = y_end - y_start
+                    
+                    if w_slice > 0 and h_slice > 0:
+                        # Composite
+                        # We use simple copy for 2D composite on empty canvas
+                        # But handle feather alpha
+                        canvas[:, y_start:y_end, x_start:x_end] = scaled_img[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                        alpha[:, y_start:y_end, x_start:x_end] = mask_small[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                
+                # For output, we want RGB + Alpha channel if possible?
+                # User asked for "transparent canvas". ComfyUI IMAGE is usually RGB.
+                # But creating a MASK output allows standard inpainting.
+                # However, if we return IMAGE with alpha, some nodes handle it.
+                # We'll return RGB (premultiplied or masked?) and explicit MASK.
+                # MASK: 1 = masked (keep), 0 = unmasked (inpaint).
+                # Actually, standard Inpainting masks: 1 = inpaint this, 0 = keep this.
+                # "transparent canvas" -> we want to inpaint the Transparent parts.
+                # So Mask = 1 where Alpha = 0. Mask = 0 where Alpha = 1.
+                # "alpha feather feather controls on the add flat image"
+                # If we feather the image, the semi-transparent parts should be partially inpainted?
+                # Usually: Mask = 1 - Alpha.
+                
+                out_img = canvas.permute(1, 2, 0) # BHWC
+                out_mask = (1.0 - alpha).squeeze(0) # BHW
+                
+            else: # perspective
+                # "perspective constrained scale" -> scale affects FOV
+                # larger scale = larger image = larger FOV coverage
+                eff_fov = fov * scale
+                
+                # Project
+                proj_img, proj_mask = _perspective_insert(
+                    img, 
+                    canvas_height, canvas_width,
+                    yaw, pitch, 0.0, # roll not exposed/default 0
+                    eff_fov,
+                    feather=feather_size
+                )
+                
+                out_img = proj_img.permute(1, 2, 0)
+                out_mask = (1.0 - proj_mask).squeeze(0)
+            
+            out_images.append(out_img)
+            out_masks.append(out_mask)
+            
+        final_images = torch.stack(out_images)
+        final_masks = torch.stack(out_masks)
+        
+        return (final_images, final_masks, context)
+
+
+class LatLongOutpaintStitch:
+    """Stitch high-res source back over generated equirectangular result."""
+    
+    DESCRIPTION = "Composite the original high-res source back over the generated result."
+    CATEGORY = "LatLong/Outpaint"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("final_equirectangular",)
+    FUNCTION = "stitch"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "generated_equirect": ("IMAGE", {"tooltip": "The generated/outpainted result."}),
+                "stitch_context": ("STITCH_CONTEXT", {"tooltip": "Context from Setup node."}),
+                "blend_mode": (["alpha", "overlay", "hard"], {"default": "alpha"}),
+            }
+        }
+
+    def stitch(self, generated_equirect, stitch_context, blend_mode):
+        # Unpack context
+        ctx = stitch_context
+        orig_flat = ctx["original_image"] # (N, H, W, C)
+        mode = ctx["placement_mode"]
+        scale = ctx["scale"]
+        tx = ctx["translate_x"]
+        ty = ctx["translate_y"]
+        yaw = ctx["yaw"]
+        pitch = ctx["pitch"]
+        fov = ctx["fov"]
+        feather = ctx["feather_size"]
+        setup_w = ctx["setup_canvas_width"]
+        
+        N, H_gen, W_gen, C_gen = generated_equirect.shape
+        device = generated_equirect.device
+        
+        # Determine scale factor between setup canvas and generation
+        # (e.g. if user upscaled the latent)
+        res_scale = W_gen / float(setup_w)
+        
+        # We need to re-generate the composite layer at the NEW resolution
+        # using the ORIGINAL high-res image.
+        
+        # Assume batch size 1 for context logic reuse, or match N
+        # If N > 1, apply same context to all? Yes.
+        
+        final_images = []
+        
+        for i in range(N):
+            gen_img = generated_equirect[i].permute(2, 0, 1) # (C, H, W)
+            orig_src = orig_flat[i % len(orig_flat)].permute(2, 0, 1) # Loop if batches mismatch
+            
+            src_c, src_h, src_w = orig_src.shape
+            
+            if mode == "2d_composite":
+                # Create empty canvas at CURRENT gen resolution
+                canvas = torch.zeros_like(gen_img)
+                alpha = torch.zeros((1, H_gen, W_gen), device=device)
+                
+                # Scale params by res_scale
+                # scale param in 2d is pixel multiplier relative to source.
+                # Wait, in Setup: "new_w = int(W * scale)".
+                # The 'scale' param is relative to the SOURCE image pixels.
+                # If we want to maintain the same relative size on the NEW canvas:
+                # The "size on canvas" in Setup was (W * scale).
+                # The "size on canvas" in Stitch should be (W * scale) * res_scale.
+                
+                # Wait, proper logic:
+                # We want the flat image to occupy the same PROPORTION of the canvas.
+                # Setup: occupied (W*scale) / setup_w fraction.
+                # Stitch: should occupy (W_new) / W_gen fraction.
+                # So W_new / W_gen = (W*scale) / setup_w
+                # => W_new = (W*scale) * (W_gen / setup_w) = (W*scale) * res_scale.
+                
+                target_w = int(src_w * scale * res_scale)
+                target_h = int(src_h * scale * res_scale)
+                
+                # Scaled feather
+                target_feather = int(feather * res_scale)
+                
+                if target_w > 0 and target_h > 0:
+                     # Resize high-res source to target size
+                     src_batch = orig_src.unsqueeze(0)
+                     scaled_src = torch.nn.functional.interpolate(src_batch, size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(0)
+                     
+                     mask_small = _create_inner_feather_mask(target_w, target_h, target_feather).to(device)
+                     
+                     # Calculate placement
+                     cx = W_gen // 2
+                     cy = H_gen // 2
+                     
+                     # Scaled offsets
+                     eff_Tx = int(tx * res_scale)
+                     eff_Ty = int(ty * res_scale)
+                     
+                     tl_x = cx - (target_w // 2) + eff_Tx
+                     tl_y = cy - (target_h // 2) + eff_Ty
+                     
+                     # Clip
+                     x_start = max(0, tl_x)
+                     y_start = max(0, tl_y)
+                     x_end = min(W_gen, tl_x + target_w)
+                     y_end = min(H_gen, tl_y + target_h)
+                     
+                     src_x = x_start - tl_x
+                     src_y = y_start - tl_y
+                     w_slice = x_end - x_start
+                     h_slice = y_end - y_start
+                     
+                     if w_slice > 0 and h_slice > 0:
+                         canvas[:, y_start:y_end, x_start:x_end] = scaled_src[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                         alpha[:, y_start:y_end, x_start:x_end] = mask_small[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                         
+            else: # perspective
+                # FOV Logic:
+                # "effective fov" depends on scale.
+                # In setup: eff_fov = fov * scale.
+                eff_fov = fov * scale
+                
+                # In stitch, the FOV is angular, so it shouldn't change with resolution!
+                # If we scale the canvas, the angular coverage is the same.
+                # So we just re-project with the SAME angular parameters,
+                # but onto a larger/smaller canvas.
+                # However, feather is in pixels relative to SOURCE image in _perspective_insert.
+                # "feather: Inner feather pixels (relative to flat image source coords)"
+                # So feather param should stay same? Yes, relative to source image.
+                # But wait, my _perspective_insert feather logic:
+                # "feather_ndc_x = (feather / W_src) * 2.0"
+                # If we use original source image, W_src is the high-res width.
+                # The user specified feather size in pixels during Setup.
+                # Setup used 'flat_image' (could be key reduced).
+                # Stitch uses 'original_image' (high res).
+                # If Setup used a downscaled image, 50px feather is large.
+                # If Stitch uses 4k image, 50px feather is small.
+                # We usually want visual consistency.
+                # If user saw 50px feather on 512px image (10%), they expect 10% feather on 4k image (400px).
+                # So we should scale feather by (W_highres / W_setup_src).
+                # Check W_src in stitch (high res) vs W in setup.
+                # Context saved 'original_image' which IS the high res.
+                # Wait, Setup takes 'flat_image'. Is that high res?
+                # User workflow:
+                # 1. LoadImage (Huge)
+                # 2. Setup (Huge) -> resize to Canvas (Medium)
+                # No, Setup takes Flat Image and puts it on Canvas.
+                # If user feeds Huge image to Setup, Setup uses Huge image.
+                # So Setup has the high res image already.
+                # So 'flat_image' in Setup IS 'original_image'.
+                # So W_src is constant.
+                # So feather pixels is constant.
+                
+                proj_img, proj_mask = _perspective_insert(
+                    orig_src,
+                    H_gen, W_gen,
+                    yaw, pitch, 0.0,
+                    eff_fov,
+                    feather=feather # Use original pixel feather
+                )
+                canvas = proj_img
+                alpha = proj_mask
+            
+            # Composite
+            # Result = Alpha * Source + (1 - Alpha) * Gen
+            # (Assuming alpha blend)
+            
+            # gen_img is (C, H, W)
+            # canvas is (C, H, W)
+            # alpha is (1, H, W)
+            
+            final = alpha * canvas + (1.0 - alpha) * gen_img
+            final_images.append(final.permute(1, 2, 0)) # BHWC
+            
+        return (torch.stack(final_images),)

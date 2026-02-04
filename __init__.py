@@ -23,6 +23,8 @@ from .nodes import (
     PanoramaViewerNode,
     PanoramaVideoViewerNode,
     EquirectangularEdgeBlender,
+    LatLongOutpaintSetup,
+    LatLongOutpaintStitch,
 )
 
 
@@ -51,6 +53,8 @@ NODE_CLASS_MAPPINGS = {
     "PanoramaViewerNode": PanoramaViewerNode,
     "PanoramaVideoViewerNode": PanoramaVideoViewerNode,
     "Equirectangular Edge Blender": EquirectangularEdgeBlender,
+    "LatLong Outpaint Setup": LatLongOutpaintSetup,
+    "LatLong Outpaint Stitch": LatLongOutpaintStitch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -78,6 +82,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PanoramaViewerNode": "Preview 360 Panorama",
     "PanoramaVideoViewerNode": "Preview 360 Video Panorama",
     "Equirectangular Edge Blender": "Equirectangular Edge Blender",
+    "LatLong Outpaint Setup": "Outpaint Setup (Canvas + Flat Image)",
+    "LatLong Outpaint Stitch": "Outpaint Stitch (High-Res Composite)",
 }
 
 WEB_DIRECTORY = "./js"

@@ -143,9 +143,34 @@ Viewer Notes
 - **Roll Image (Wrap)** / **Roll Mask (Wrap)**: Fast wraparound rolling without resampling.
 - **Apply Circular Padding Model/VAE**: Adds circular x-axis Conv2d padding to reduce seam artifacts (reload to undo if applied inplace).
 
+### Outpainting Nodes
+   
+12) **LatLong Outpaint Setup**
+- Purpose: Prepare a transparent equirectangular canvas with a source flat image for outpainting/inpainting.
+- Inputs:
+  - `flat_image`: Source rectilinear image
+  - `canvas_width`, `canvas_height`: Canvas dimensions (usually 2:1)
+  - `placement_mode`: 2d_composite | perspective
+  - `scale`: Pixel scale (2D) or FOV multiplier (Perspective)
+  - `translate_x`, `translate_y` (2D only)
+  - `yaw`, `pitch`, `fov` (Perspective only)
+  - `feather_size`: Inner edge feathering for smooth blending
+- Outputs:
+  - `composite_image`: Canvas with image placed (use for inpainting reference)
+  - `outpaint_mask`: Mask where generated content should go
+  - `stitch_context`: Data bundle for Stitch node
+
+13) **LatLong Outpaint Stitch**
+- Purpose: Composite the original high-res source image back over the generated result.
+- Inputs:
+  - `generated_equirect`: Result from KSampler/Inpainting
+  - `stitch_context`: From Setup node
+  - `blend_mode`: alpha | overlay | hard
+- Features: Automatically scales high-res source to match generation resolution, preserving original detail.
+
 ### Post-Processing Nodes
 
-12) **Equirectangular Edge Blender**
+14) **Equirectangular Edge Blender**
 - Purpose: Blend left and right edges for seamless wraparound continuity.
 - **NEW**: Essential for eliminating visible seams in 360° viewers
 - Inputs:
@@ -162,7 +187,7 @@ Viewer Notes
 
 ### Interactive Viewer Nodes
 
-13) **Preview 360 Panorama**
+15) **Preview 360 Panorama**
 - Purpose: Interactive 360° panorama viewer with real-time navigation.
 - Features:
   - Three.js-based WebGL rendering
@@ -172,7 +197,7 @@ Viewer Notes
 - Inputs: `images` (equirectangular), `max_width` (resize limit, default 4096)
 - Use Case: Preview and explore panoramas directly in ComfyUI workflow
 
-14) **Preview 360 Video Panorama**
+16) **Preview 360 Video Panorama**
 - Purpose: Interactive 360° video panorama viewer with frame-by-frame playback.
 - Features:
   - Frame-by-frame 360° video playback
@@ -235,11 +260,15 @@ Viewer Notes
 **Seam Inpainting Workflow**
 - Roll Image (Wrap) (50% x-roll)  Create Seam Mask  inpaint/composite  Roll Image (Wrap) back  (optional) Equirectangular Edge Blender.
 
+**Outpainting / Compositing**
+- **Setup**: Connect Flat Image to `LatLong Outpaint Setup`. Choose `perspective` mode, adjust `yaw`/`pitch` to place image on the sphere.
+- **Inpaint**: Use `composite_image` and `outpaint_mask` with VAE Encode (for Inpainting) -> KSampler.
+- **Stitch**: Connect KSampler output and `stitch_context` to `LatLong Outpaint Stitch` to overlay the crisp original source on top of the generation.
+
 **Seam-Safe Generation**
 - Apply Circular Padding Model/VAE before sampling/decoding to reduce x-seam artifacts (reload model/vae to undo if applied inplace).
 
 ## Technical Notes
-
 Coordinate System
 - Accurate spherical transforms with longitude wrapping and pole handling.
 
