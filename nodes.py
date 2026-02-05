@@ -2215,6 +2215,7 @@ def _perspective_insert(
     lat = (math.pi / 2) - (yg / canvas_h) * math.pi
     
     # Spherical -> Cartesian (world direction vectors)
+    # Convention: +X = lon 0 (front), +Y = lon 90 (right), +Z = lat 90 (up/north pole)
     cos_lat = torch.cos(lat)
     x_world = cos_lat * torch.cos(lon)
     y_world = cos_lat * torch.sin(lon)
@@ -2224,24 +2225,28 @@ def _perspective_insert(
     xyz_world = torch.stack([x_world, y_world, z_world], dim=-1)
     
     # 2. Rotate World -> Camera (Inverse Rotation)
-    # We use the existing rotation matrix function but need to apply it inversely.
-    # The processor's matrix transforms P_camera -> P_world.
-    # So P_camera = P_world * R (since it uses row vectors x matrix_T)
-    # Wait, check EquirectangularProcessor.create_rotation_matrix usage:
-    # rotated_points = points_flat @ rotation_matrix.T
-    # This implies rotation_matrix maps source -> dest.
-    # For perspective extract: Camera Ray (canonical) -> Rotated Ray (world)
-    # So R maps Camera -> World.
-    # Here we want World -> Camera. So we need inverse of R (which is R.T).
+    # First apply user rotation, then we'll reinterpret axes so camera looks at equator by default.
+    # 
+    # The user's yaw/pitch should match intuitive behavior:
+    # - yaw=0, pitch=0: look at center/equator (world +X)
+    # - yaw rotates horizontally, pitch rotates vertically
+    #
+    # To achieve this, we need the camera's +Z (look direction) to map to world +X at identity.
+    # Standard camera: looks down +Z with +X right, +Y down.
+    # We want: camera +Z -> world +X, camera +X -> world +Y, camera +Y -> world -Z
+    #
+    # After applying user rotation R to world points, we remap axes:
+    # cam_x = world_y, cam_y = -world_z, cam_z = world_x
     
     R = EquirectangularProcessor._torch_rotation_matrix(yaw, pitch, roll, device, torch.float32)
     # xyz_cam = xyz_world @ R (since R maps Cam->World, R.T maps World->Cam)
-    # Note: P @ R.T is "apply rotation vector". 
-    # If R is Cam->World, then P_world = P_cam @ R.T (standard row-vector multiplication)
-    # So P_cam = P_world @ (R.T)^-1 = P_world @ R
-    xyz_cam = torch.tensordot(xyz_world, R, dims=1) # (H, W, 3)
+    xyz_rotated = torch.tensordot(xyz_world, R, dims=1)  # (H, W, 3)
     
-    x_c, y_c, z_c = xyz_cam[..., 0], xyz_cam[..., 1], xyz_cam[..., 2]
+    # Remap axes so camera looks at equator (+X) by default
+    # cam_z = world_x (look direction), cam_x = world_y (right), cam_y = -world_z (down)
+    x_c = xyz_rotated[..., 1]   # world_y -> cam_x
+    y_c = -xyz_rotated[..., 2]  # -world_z -> cam_y (down direction)
+    z_c = xyz_rotated[..., 0]   # world_x -> cam_z (look direction)
     
     # 3. Project Camera -> Flat Image Plane
     # Canonical camera looks usually down +Z or +X. 
@@ -2256,7 +2261,7 @@ def _perspective_insert(
     
     # Perspective projection
     # u_norm = x_c / z_c, v_norm = y_c / z_c
-    # But we need to handle numerical stability.
+    # y_c already accounts for down direction from axis remapping
     z_c = torch.clamp(z_c, min=1e-6)
     u_norm = x_c / z_c
     v_norm = y_c / z_c
@@ -2348,12 +2353,12 @@ class LatLongOutpaintSetup:
                 "canvas_width": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 8, "tooltip": "Width of the equirectangular canvas."}),
                 "canvas_height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8, "tooltip": "Height of the equirectangular canvas."}),
                 "placement_mode": (["2d_composite", "perspective"], {"default": "2d_composite"}),
-                "scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "2D: Pixel scale. Perspective: FOV multiplier."}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01, "tooltip": "Image size multiplier. 1.0 = original size relative to canvas."}),
                 "translate_x": ("INT", {"default": 0, "min": -4096, "max": 4096, "step": 1, "tooltip": "2D only: Horizontal pixel offset."}),
                 "translate_y": ("INT", {"default": 0, "min": -4096, "max": 4096, "step": 1, "tooltip": "2D only: Vertical pixel offset."}),
                 "yaw": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Perspective only: Horizontal view angle."}),
                 "pitch": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0, "tooltip": "Perspective only: Vertical view angle."}),
-                "fov": ("FLOAT", {"default": 90.0, "min": 10.0, "max": 170.0, "step": 1.0, "tooltip": "Perspective only: Base Field of View."}),
+                "fov": ("FLOAT", {"default": 90.0, "min": 10.0, "max": 170.0, "step": 1.0, "tooltip": "Perspective only: Field of View at scale=1.0."}),
                 "feather_size": ("INT", {"default": 50, "min": 0, "max": 500, "step": 1, "tooltip": "Inner feathering in pixels."}),
             }
         }
@@ -2433,7 +2438,7 @@ class LatLongOutpaintSetup:
                         # We use simple copy for 2D composite on empty canvas
                         # But handle feather alpha
                         canvas[:, y_start:y_end, x_start:x_end] = scaled_img[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
-                        alpha[:, y_start:y_end, x_start:x_end] = mask_small[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                        alpha[:, y_start:y_end, x_start:x_end] = mask_small[src_y:src_y+h_slice, src_x:src_x+w_slice].unsqueeze(0)
                 
                 # For output, we want RGB + Alpha channel if possible?
                 # User asked for "transparent canvas". ComfyUI IMAGE is usually RGB.
@@ -2452,9 +2457,21 @@ class LatLongOutpaintSetup:
                 out_mask = (1.0 - alpha).squeeze(0) # BHW
                 
             else: # perspective
-                # "perspective constrained scale" -> scale affects FOV
-                # larger scale = larger image = larger FOV coverage
+                # Perspective projection with proper scale normalization:
+                # 
+                # The `fov` parameter directly controls the field of view for the projection.
+                # A typical camera has 50-90 degree FOV. Default is 90.
+                # 
+                # The `scale` parameter affects the angular coverage on the panorama:
+                # - scale=1.0 with fov=90 means the image covers 90 degrees of the panorama
+                # - scale=0.5 with fov=90 means the image covers 45 degrees (appears smaller)
+                # - scale=2.0 with fov=90 means the image covers 180 degrees (appears larger)
+                #
+                # This keeps distortion controlled (based on fov) while scale adjusts size.
                 eff_fov = fov * scale
+                
+                # Clamp FOV to reasonable range to prevent extreme distortion
+                eff_fov = max(5.0, min(150.0, eff_fov))
                 
                 # Project
                 proj_img, proj_mask = _perspective_insert(
@@ -2588,44 +2605,14 @@ class LatLongOutpaintStitch:
                      
                      if w_slice > 0 and h_slice > 0:
                          canvas[:, y_start:y_end, x_start:x_end] = scaled_src[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
-                         alpha[:, y_start:y_end, x_start:x_end] = mask_small[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
+                         alpha[:, y_start:y_end, x_start:x_end] = mask_small[src_y:src_y+h_slice, src_x:src_x+w_slice].unsqueeze(0)
                          
             else: # perspective
-                # FOV Logic:
-                # "effective fov" depends on scale.
-                # In setup: eff_fov = fov * scale.
+                # Use the same FOV calculation as Setup: fov * scale
                 eff_fov = fov * scale
                 
-                # In stitch, the FOV is angular, so it shouldn't change with resolution!
-                # If we scale the canvas, the angular coverage is the same.
-                # So we just re-project with the SAME angular parameters,
-                # but onto a larger/smaller canvas.
-                # However, feather is in pixels relative to SOURCE image in _perspective_insert.
-                # "feather: Inner feather pixels (relative to flat image source coords)"
-                # So feather param should stay same? Yes, relative to source image.
-                # But wait, my _perspective_insert feather logic:
-                # "feather_ndc_x = (feather / W_src) * 2.0"
-                # If we use original source image, W_src is the high-res width.
-                # The user specified feather size in pixels during Setup.
-                # Setup used 'flat_image' (could be key reduced).
-                # Stitch uses 'original_image' (high res).
-                # If Setup used a downscaled image, 50px feather is large.
-                # If Stitch uses 4k image, 50px feather is small.
-                # We usually want visual consistency.
-                # If user saw 50px feather on 512px image (10%), they expect 10% feather on 4k image (400px).
-                # So we should scale feather by (W_highres / W_setup_src).
-                # Check W_src in stitch (high res) vs W in setup.
-                # Context saved 'original_image' which IS the high res.
-                # Wait, Setup takes 'flat_image'. Is that high res?
-                # User workflow:
-                # 1. LoadImage (Huge)
-                # 2. Setup (Huge) -> resize to Canvas (Medium)
-                # No, Setup takes Flat Image and puts it on Canvas.
-                # If user feeds Huge image to Setup, Setup uses Huge image.
-                # So Setup has the high res image already.
-                # So 'flat_image' in Setup IS 'original_image'.
-                # So W_src is constant.
-                # So feather pixels is constant.
+                # Clamp FOV to reasonable range to prevent extreme distortion
+                eff_fov = max(5.0, min(150.0, eff_fov))
                 
                 proj_img, proj_mask = _perspective_insert(
                     orig_src,
