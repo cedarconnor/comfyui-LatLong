@@ -2457,29 +2457,43 @@ class LatLongOutpaintSetup:
                 out_mask = (1.0 - alpha).squeeze(0) # BHW
                 
             else: # perspective
-                # Perspective projection with proper scale normalization:
+                # Perspective projection with proper scale behavior:
                 # 
-                # The `fov` parameter directly controls the field of view for the projection.
-                # A typical camera has 50-90 degree FOV. Default is 90.
-                # 
-                # The `scale` parameter affects the angular coverage on the panorama:
-                # - scale=1.0 with fov=90 means the image covers 90 degrees of the panorama
-                # - scale=0.5 with fov=90 means the image covers 45 degrees (appears smaller)
-                # - scale=2.0 with fov=90 means the image covers 180 degrees (appears larger)
+                # The `fov` parameter controls the projection distortion (how "wide" the lens is).
+                # The `scale` parameter controls the projected image SIZE on the canvas.
                 #
-                # This keeps distortion controlled (based on fov) while scale adjusts size.
-                eff_fov = fov * scale
+                # To scale the size WITHOUT increasing distortion, we scale the source image
+                # dimensions and keep FOV constant. A larger source image projected at the
+                # same FOV will cover more of the panorama.
                 
-                # Clamp FOV to reasonable range to prevent extreme distortion
-                eff_fov = max(5.0, min(150.0, eff_fov))
+                # Scale the source image first if scale != 1
+                if abs(scale - 1.0) > 0.001:
+                    scaled_h = int(H * scale)
+                    scaled_w = int(W * scale)
+                    if scaled_h > 0 and scaled_w > 0:
+                        img_batch = img.unsqueeze(0)
+                        img_scaled = torch.nn.functional.interpolate(
+                            img_batch, size=(scaled_h, scaled_w), 
+                            mode='bilinear', align_corners=False
+                        ).squeeze(0)
+                    else:
+                        img_scaled = img
+                else:
+                    img_scaled = img
+                
+                # Use fov directly (no scaling) - controls distortion
+                eff_fov = max(5.0, min(150.0, fov))
+                
+                # Scale feather proportionally
+                scaled_feather = int(feather_size * scale) if scale > 1.0 else feather_size
                 
                 # Project
                 proj_img, proj_mask = _perspective_insert(
-                    img, 
+                    img_scaled, 
                     canvas_height, canvas_width,
                     yaw, pitch, 0.0, # roll not exposed/default 0
                     eff_fov,
-                    feather=feather_size
+                    feather=scaled_feather
                 )
                 
                 out_img = proj_img.permute(1, 2, 0)
@@ -2526,9 +2540,16 @@ class LatLongOutpaintStitch:
         fov = ctx["fov"]
         feather = ctx["feather_size"]
         setup_w = ctx["setup_canvas_width"]
+        setup_h = ctx["setup_canvas_height"]
         
         N, H_gen, W_gen, C_gen = generated_equirect.shape
         device = generated_equirect.device
+        
+        # Debug info
+        print(f"[Stitch Debug] Generated equirect shape: {generated_equirect.shape}")
+        print(f"[Stitch Debug] Original flat shape: {orig_flat.shape}")
+        print(f"[Stitch Debug] Setup canvas: {setup_w}x{setup_h}")
+        print(f"[Stitch Debug] Mode: {mode}, Scale: {scale}, Feather: {feather}")
         
         # Determine scale factor between setup canvas and generation
         # (e.g. if user upscaled the latent)
@@ -2574,12 +2595,16 @@ class LatLongOutpaintStitch:
                 # Scaled feather
                 target_feather = int(feather * res_scale)
                 
+                print(f"[Stitch Debug] 2D: target_w={target_w}, target_h={target_h}, target_feather={target_feather}, res_scale={res_scale}")
+                
                 if target_w > 0 and target_h > 0:
                      # Resize high-res source to target size
                      src_batch = orig_src.unsqueeze(0)
                      scaled_src = torch.nn.functional.interpolate(src_batch, size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(0)
                      
                      mask_small = _create_inner_feather_mask(target_w, target_h, target_feather).to(device)
+                     
+                     print(f"[Stitch Debug] 2D: mask_small shape={mask_small.shape}, min={mask_small.min():.3f}, max={mask_small.max():.3f}")
                      
                      # Calculate placement
                      cx = W_gen // 2
@@ -2603,23 +2628,47 @@ class LatLongOutpaintStitch:
                      w_slice = x_end - x_start
                      h_slice = y_end - y_start
                      
+                     print(f"[Stitch Debug] 2D: placement x={x_start}:{x_end}, y={y_start}:{y_end}, w_slice={w_slice}, h_slice={h_slice}")
+                     
                      if w_slice > 0 and h_slice > 0:
                          canvas[:, y_start:y_end, x_start:x_end] = scaled_src[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
                          alpha[:, y_start:y_end, x_start:x_end] = mask_small[src_y:src_y+h_slice, src_x:src_x+w_slice].unsqueeze(0)
-                         
+                         print(f"[Stitch Debug] 2D: alpha after placement min={alpha.min():.3f}, max={alpha.max():.3f}, sum={alpha.sum():.0f}")
+                     else:
+                         print("[Stitch Debug] 2D: w_slice or h_slice is 0, no placement")
+                else:
+                     print("[Stitch Debug] 2D: target_w or target_h is 0, skipping")
             else: # perspective
-                # Use the same FOV calculation as Setup: fov * scale
-                eff_fov = fov * scale
+                # Scale the source image to control size (same approach as Setup)
+                # This avoids distortion from increasing FOV
+                src_c, src_h, src_w = orig_src.shape
                 
-                # Clamp FOV to reasonable range to prevent extreme distortion
-                eff_fov = max(5.0, min(150.0, eff_fov))
+                if abs(scale - 1.0) > 0.001:
+                    scaled_h = int(src_h * scale)
+                    scaled_w = int(src_w * scale)
+                    if scaled_h > 0 and scaled_w > 0:
+                        src_batch = orig_src.unsqueeze(0)
+                        src_scaled = torch.nn.functional.interpolate(
+                            src_batch, size=(scaled_h, scaled_w),
+                            mode='bilinear', align_corners=False
+                        ).squeeze(0)
+                    else:
+                        src_scaled = orig_src
+                else:
+                    src_scaled = orig_src
+                
+                # Use fov directly - controls distortion
+                eff_fov = max(5.0, min(150.0, fov))
+                
+                # Scale feather proportionally
+                scaled_feather = int(feather * scale) if scale > 1.0 else feather
                 
                 proj_img, proj_mask = _perspective_insert(
-                    orig_src,
+                    src_scaled,
                     H_gen, W_gen,
                     yaw, pitch, 0.0,
                     eff_fov,
-                    feather=feather # Use original pixel feather
+                    feather=scaled_feather
                 )
                 canvas = proj_img
                 alpha = proj_mask
@@ -2633,6 +2682,9 @@ class LatLongOutpaintStitch:
             # alpha is (1, H, W)
             
             final = alpha * canvas + (1.0 - alpha) * gen_img
+            print(f"[Stitch Debug] Frame {i}: gen_img shape: {gen_img.shape}, canvas shape: {canvas.shape}, alpha shape: {alpha.shape}, final shape: {final.shape}")
             final_images.append(final.permute(1, 2, 0)) # BHWC
             
-        return (torch.stack(final_images),)
+        result = torch.stack(final_images)
+        print(f"[Stitch Debug] Final result shape: {result.shape}")
+        return (result,)
