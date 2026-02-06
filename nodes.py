@@ -2351,7 +2351,8 @@ class LatLongOutpaintSetup:
             "required": {
                 "flat_image": ("IMAGE", {"tooltip": "Source rectilinear image to place."}),
                 "canvas_width": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 8, "tooltip": "Width of the equirectangular canvas."}),
-                "canvas_height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8, "tooltip": "Height of the equirectangular canvas."}),
+                "canvas_height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8, "tooltip": "Height of the equirectangular canvas (ignored if force 2:1 is enabled)."}),
+                "force_2by1_aspect": ("BOOLEAN", {"default": True, "tooltip": "Force 2:1 aspect ratio (height = width/2). Required for equirectangular format."}),
                 "placement_mode": (["2d_composite", "perspective"], {"default": "2d_composite"}),
                 "scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01, "tooltip": "Image size multiplier. 1.0 = original size relative to canvas."}),
                 "translate_x": ("INT", {"default": 0, "min": -4096, "max": 4096, "step": 1, "tooltip": "2D only: Horizontal pixel offset."}),
@@ -2363,10 +2364,10 @@ class LatLongOutpaintSetup:
             }
         }
 
-    def setup(self, flat_image, canvas_width, canvas_height, placement_mode, scale, translate_x, translate_y, yaw, pitch, fov, feather_size):
-        # Force 2:1 aspect ratio if requested or just use inputs? User said "force 2x1".
-        # We will force height = width // 2
-        canvas_height = canvas_width // 2
+    def setup(self, flat_image, canvas_width, canvas_height, force_2by1_aspect, placement_mode, scale, translate_x, translate_y, yaw, pitch, fov, feather_size):
+        # Apply 2:1 aspect ratio constraint if enabled
+        if force_2by1_aspect:
+            canvas_height = canvas_width // 2
         
         N, H, W, C = flat_image.shape
         device = flat_image.device
