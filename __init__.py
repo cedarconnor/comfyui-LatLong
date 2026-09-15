@@ -86,6 +86,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LatLong Outpaint Stitch": "Outpaint Stitch (High-Res Composite)",
 }
 
+from .workflow_nodes import WORKFLOW_NODES
+
+NODE_CLASS_MAPPINGS.update(WORKFLOW_NODES)
+NODE_DISPLAY_NAME_MAPPINGS.update({name: name for name in WORKFLOW_NODES})
+
 WEB_DIRECTORY = "./js"
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']

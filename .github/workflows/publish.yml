@@ -12,7 +12,10 @@ permissions:
   issues: write
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
   publish-node:
+    needs: test
     name: Publish Custom Node to registry
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'cedarconnor' }}

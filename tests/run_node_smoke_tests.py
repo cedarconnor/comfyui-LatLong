@@ -20,6 +20,9 @@ def stub_comfy_modules():
     comfy.utils = utils
     sys.modules['comfy'] = comfy
     sys.modules['comfy.utils'] = utils
+    management = types.ModuleType('comfy.model_management')
+    management.throw_exception_if_processing_interrupted = lambda: None
+    sys.modules['comfy.model_management'] = management
 
     folder_paths = types.ModuleType('folder_paths')
     sys.modules['folder_paths'] = folder_paths
@@ -76,6 +79,8 @@ def to_batch_tensor(np_img, batch=2):
 
 
 def assert_range01(arr, name, atol=1e-3):
+    if not np.isfinite(arr).all():
+        raise AssertionError(f"{name} contains nonfinite values")
     mn = float(np.min(arr))
     mx = float(np.max(arr))
     if mn < -atol or mx > 1.0 + atol:
