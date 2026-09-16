@@ -1,0 +1,5 @@
+ComfyUI LatLong
+
+This project is licensed under the Apache License, Version 2.0.
+Bundled Three.js r172 is distributed under its own MIT license;
+see js/lib/THREE-LICENSE.txt. Other dependencies retain their own licenses.

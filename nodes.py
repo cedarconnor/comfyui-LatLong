@@ -8,10 +8,30 @@ from io import BytesIO
 
 import folder_paths
 from comfy.utils import ProgressBar
+from comfy.model_management import throw_exception_if_processing_interrupted
 from PIL import Image
 
 from .modules.equirectangular_processor import EquirectangularProcessor
 import math
+
+
+def _validate_image(image):
+    if not isinstance(image, torch.Tensor) or image.ndim != 4 or min(image.shape) < 1 or image.shape[-1] not in (1, 3, 4):
+        raise ValueError("Expected a nonempty IMAGE tensor (B,H,W,C), C=1,3,4")
+    if not torch.isfinite(image).all():
+        raise ValueError("IMAGE contains NaN or infinity")
+
+
+def _use_gpu(backend, interpolation, image=None):
+    if backend not in ("auto", "cpu", "gpu"):
+        raise ValueError("Unknown backend")
+    if backend == "gpu" and (not torch.cuda.is_available() or interpolation not in ("bilinear", "nearest")):
+        raise ValueError("GPU requires CUDA and bilinear/nearest; choose CPU for bicubic/Lanczos")
+    if backend == "auto" and image is not None and torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info()
+        if image.numel() * image.element_size() * 4 > free * .6:
+            return False
+    return backend != "cpu" and torch.cuda.is_available() and interpolation in ("bilinear", "nearest")
 
 
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -159,7 +179,7 @@ class EquirectangularRotate:
     """ComfyUI node for rotating equirectangular images and adjusting horizon"""
     # Displayed by some UIs as a node tooltip/description
     DESCRIPTION = "Rotate an equirectangular (360°) image with yaw/pitch/roll and adjust the horizon."
-    
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -177,12 +197,12 @@ class EquirectangularRotate:
                 "tile_size": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 512, "tooltip": "Tile size in pixels for tiled processing. Smaller = less memory, more tiles."}),
             }
         }
-    
+
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("rotated_image",)
     FUNCTION = "rotate_equirectangular"
     CATEGORY = "LatLong"
-    
+
     def rotate_equirectangular(self,
                              image: torch.Tensor,
                              yaw_rotation: float = 0.0,
@@ -193,14 +213,15 @@ class EquirectangularRotate:
                              backend: str = "auto",
                              use_tiling: str = "auto",
                              tile_size: int = 2048) -> Tuple[torch.Tensor]:
-        
+
         # Convert ComfyUI tensor format (B, H, W, C) to numpy
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
-        
+
         # Progress bar for batch processing
         pbar = ProgressBar(batch_size)
-        
+
         for i in range(batch_size):
             # Get single image and convert to numpy
             img_tensor = image[i]  # (H, W, C)
@@ -219,16 +240,18 @@ class EquirectangularRotate:
             # else: "auto" means None, which auto-decides based on image size
 
             # Choose backend
-            use_gpu = (backend == 'gpu') or (backend == 'auto' and torch.cuda.is_available())
+            use_gpu = _use_gpu(backend, interpolation, image)
             if use_gpu:
-                img_dev = image[i].to('cuda')
+                img_dev = image[i].to(device='cuda', dtype=torch.float32)
                 proc_t = EquirectangularProcessor.torch_rotate_equirectangular(
                     img_dev,
                     yaw=yaw_rotation,
                     pitch=pitch_rotation,
                     roll=roll_rotation,
                     horizon_offset=horizon_offset,
-                    interpolation=interpolation if interpolation in ('bilinear', 'nearest') else 'bilinear'
+                    interpolation=interpolation,
+                    tile_size=image.shape[1] if use_tiling == "disabled" else max(1, min(tile_size, 262144 // image.shape[2])),
+                    progress_callback=throw_exception_if_processing_interrupted
                 ).to('cpu').numpy()
                 processed_img = proc_t
             else:
@@ -240,17 +263,18 @@ class EquirectangularRotate:
                     horizon_offset=horizon_offset,
                     interpolation=interpolation,
                     use_tiling=use_tiling_bool,
-                    tile_size=tile_size
+                    tile_size=tile_size,
+                    progress_callback=throw_exception_if_processing_interrupted
                 )
-            
+
             # Ensure output is float32 in [0,1] range
             processed_img = np.clip(processed_img, 0.0, 1.0).astype(np.float32)
-            
+
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
-            
-            pbar.update(i + 1)
-        
+
+            pbar.update(1)
+
         # Stack back to batch format
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -259,7 +283,7 @@ class EquirectangularRotate:
 class EquirectangularCrop180:
     """ComfyUI node for cropping equirectangular images to 180 degrees"""
     DESCRIPTION = "Extract a horizontal FOV (default 180°) window from an equirectangular image with optional aspect preservation."
-    
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -275,12 +299,12 @@ class EquirectangularCrop180:
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling filter for resizing after extraction."}),
             }
         }
-    
+
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("cropped_image",)
     FUNCTION = "crop_to_180"
     CATEGORY = "LatLong"
-    
+
     def crop_to_180(self,
                    image: torch.Tensor,
                    output_width: int = 1024,
@@ -289,20 +313,21 @@ class EquirectangularCrop180:
                    center_longitude_deg: float = 0.0,
                    fov_degrees: float = 180.0,
                    interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
-        
+
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
-        
+
         pbar = ProgressBar(batch_size)
-        
+
         for i in range(batch_size):
             img_tensor = image[i]
             img_numpy = img_tensor.cpu().numpy()
-            
+
             # Keep float32 for processing
             if img_numpy.dtype != np.float32:
                 img_numpy = img_numpy.astype(np.float32)
-            
+
             # Determine output dimensions
             out_w = output_width
             out_h = output_height
@@ -311,7 +336,7 @@ class EquirectangularCrop180:
                 H, W = img_numpy.shape[:2]
                 crop_width_px = max(1, int(round(W * (float(fov_degrees) / 360.0))))
                 out_h = max(1, int(round(out_w * (H / crop_width_px))))
-            
+
             # Crop the image
             cropped_img = EquirectangularProcessor.crop_to_180(
                 img_numpy,
@@ -321,15 +346,15 @@ class EquirectangularCrop180:
                 center_longitude_deg=center_longitude_deg,
                 fov_degrees=fov_degrees
             )
-            
+
             # Ensure output is float32 in [0,1] range
             cropped_img = np.clip(cropped_img, 0.0, 1.0).astype(np.float32)
-            
+
             cropped_tensor = torch.from_numpy(cropped_img)
             processed_images.append(cropped_tensor)
-            
-            pbar.update(i + 1)
-        
+
+            pbar.update(1)
+
         result = torch.stack(processed_images, dim=0)
         return (result,)
 
@@ -337,7 +362,7 @@ class EquirectangularCrop180:
 class EquirectangularProcessor_Combined:
     """Combined ComfyUI node for all equirectangular operations"""
     DESCRIPTION = "Rotate an equirectangular image, then optionally crop to 180° or to a centered square — all in one node. (Square crop takes precedence.)"
-    
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -357,12 +382,12 @@ class EquirectangularProcessor_Combined:
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Resampling filter used by rotation/crop steps."}),
             }
         }
-    
+
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("processed_image",)
     FUNCTION = "process_equirectangular"
     CATEGORY = "LatLong"
-    
+
     def process_equirectangular(self,
                               image: torch.Tensor,
                               yaw_rotation: float = 0.0,
@@ -374,20 +399,21 @@ class EquirectangularProcessor_Combined:
                               output_width: int = 1024,
                               output_height: int = 512,
                               interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
-        
+
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
-        
+
         pbar = ProgressBar(batch_size)
-        
+
         for i in range(batch_size):
             img_tensor = image[i]
             img_numpy = img_tensor.cpu().numpy()
-            
+
             # Keep float32 for processing
             if img_numpy.dtype != np.float32:
                 img_numpy = img_numpy.astype(np.float32)
-            
+
             # Process the image with all operations
             processed_img = EquirectangularProcessor.process_equirectangular(
                 img_numpy,
@@ -401,15 +427,15 @@ class EquirectangularProcessor_Combined:
                 output_height=output_height if crop_to_180 else None,
                 interpolation=interpolation
             )
-            
+
             # Ensure output is float32 in [0,1] range
             processed_img = np.clip(processed_img, 0.0, 1.0).astype(np.float32)
-            
+
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
-            
-            pbar.update(i + 1)
-        
+
+            pbar.update(1)
+
         result = torch.stack(processed_images, dim=0)
         return (result,)
 
@@ -417,7 +443,7 @@ class EquirectangularProcessor_Combined:
 class EquirectangularCropSquare:
     """ComfyUI node for cropping equirectangular images to square (width = height)"""
     DESCRIPTION = "Center-crop an equirectangular image to a perfect square (width equals original height)."
-    
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -428,43 +454,44 @@ class EquirectangularCropSquare:
                 "interpolation": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos", "tooltip": "Not used for pure center-crop; included for consistency."}),
             }
         }
-    
+
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("square_image",)
     FUNCTION = "crop_to_square"
     CATEGORY = "LatLong"
-    
+
     def crop_to_square(self,
                       image: torch.Tensor,
                       interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
-        
+
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
-        
+
         pbar = ProgressBar(batch_size)
-        
+
         for i in range(batch_size):
             img_tensor = image[i]
             img_numpy = img_tensor.cpu().numpy()
-            
+
             # Keep float32 for processing
             if img_numpy.dtype != np.float32:
                 img_numpy = img_numpy.astype(np.float32)
-            
+
             # Crop the image to square
             cropped_img = EquirectangularProcessor.crop_to_square(
                 img_numpy,
                 interpolation=interpolation
             )
-            
+
             # Ensure output is float32 in [0,1] range
             cropped_img = np.clip(cropped_img, 0.0, 1.0).astype(np.float32)
-            
+
             cropped_tensor = torch.from_numpy(cropped_img)
             processed_images.append(cropped_tensor)
-            
-            pbar.update(i + 1)
-        
+
+            pbar.update(1)
+
         result = torch.stack(processed_images, dim=0)
         return (result,)
 
@@ -506,6 +533,7 @@ class EquirectangularPerspectiveExtract:
                             output_height: int = 1024,
                             interpolation: str = "lanczos",
                             backend: str = "auto") -> Tuple[torch.Tensor]:
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
 
@@ -517,9 +545,9 @@ class EquirectangularPerspectiveExtract:
             if img_numpy.dtype != np.float32:
                 img_numpy = img_numpy.astype(np.float32)
 
-            use_gpu = (backend == 'gpu') or (backend == 'auto' and torch.cuda.is_available())
+            use_gpu = _use_gpu(backend, interpolation, image)
             if use_gpu:
-                img_dev = image[i].to('cuda')
+                img_dev = image[i].to(device='cuda', dtype=torch.float32)
                 persp_t = EquirectangularProcessor.torch_perspective_extract(
                     img_dev,
                     out_width=output_width,
@@ -528,7 +556,7 @@ class EquirectangularPerspectiveExtract:
                     pitch=pitch_rotation,
                     roll=roll_rotation,
                     fov_degrees=fov_degrees,
-                    interpolation=interpolation if interpolation in ('bilinear', 'nearest') else 'bilinear'
+                    interpolation=interpolation
                 ).to('cpu').numpy()
                 persp_img = persp_t
             else:
@@ -545,7 +573,7 @@ class EquirectangularPerspectiveExtract:
 
             persp_img = np.clip(persp_img, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(persp_img))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -578,6 +606,7 @@ class EquirectangularToCubemap:
                    face_size: int = 512,
                    layout: str = "3x2",
                    interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
 
@@ -595,7 +624,7 @@ class EquirectangularToCubemap:
             )
             atlas = np.clip(atlas, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(atlas))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -630,6 +659,7 @@ class CubemapToEquirectangular:
                           output_height: int = 1024,
                           layout: str = "3x2",
                           interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        _validate_image(cubemap_atlas)
         batch_size = cubemap_atlas.shape[0]
         processed_images = []
 
@@ -649,7 +679,7 @@ class CubemapToEquirectangular:
             )
             equirect = np.clip(equirect, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(equirect))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -680,6 +710,7 @@ class EquirectangularMirrorFlip:
                    image: torch.Tensor,
                    mirror_horizontal: bool = False,
                    mirror_vertical: bool = False) -> Tuple[torch.Tensor]:
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
 
@@ -697,7 +728,7 @@ class EquirectangularMirrorFlip:
             )
             flipped = np.clip(flipped, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(flipped))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -732,6 +763,7 @@ class EquirectangularResize:
               output_height: int = 1024,
               maintain_aspect: bool = True,
               interpolation: str = "lanczos") -> Tuple[torch.Tensor]:
+        _validate_image(image)
         batch_size = image.shape[0]
         processed_images = []
 
@@ -751,7 +783,7 @@ class EquirectangularResize:
             )
             resized = np.clip(resized, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(resized))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -793,6 +825,7 @@ class EquirectangularRotatePreset:
                      interpolation: str = "lanczos",
                      backend: str = "auto") -> Tuple[torch.Tensor]:
         # Get preset rotation values
+        _validate_image(image)
         preset_yaw, preset_pitch, preset_roll = EquirectangularProcessor.get_preset_rotation(preset)
 
         # Apply offsets
@@ -813,16 +846,16 @@ class EquirectangularRotatePreset:
                 img_numpy = img_numpy.astype(np.float32)
 
             # Choose backend
-            use_gpu = (backend == 'gpu') or (backend == 'auto' and torch.cuda.is_available())
+            use_gpu = _use_gpu(backend, interpolation, image)
             if use_gpu:
-                img_dev = image[i].to('cuda')
+                img_dev = image[i].to(device='cuda', dtype=torch.float32)
                 proc_t = EquirectangularProcessor.torch_rotate_equirectangular(
                     img_dev,
                     yaw=final_yaw,
                     pitch=final_pitch,
                     roll=final_roll,
                     horizon_offset=horizon_offset,
-                    interpolation=interpolation if interpolation in ('bilinear', 'nearest') else 'bilinear'
+                    interpolation=interpolation
                 ).to('cpu').numpy()
                 processed_img = proc_t
             else:
@@ -839,7 +872,7 @@ class EquirectangularRotatePreset:
             processed_tensor = torch.from_numpy(processed_img)
             processed_images.append(processed_tensor)
 
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -870,6 +903,7 @@ class CubemapFacesExtract:
                      image: torch.Tensor,
                      face_size: int = 512,
                      interpolation: str = "lanczos") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _validate_image(image)
         batch_size = image.shape[0]
 
         left_faces = []
@@ -911,7 +945,7 @@ class CubemapFacesExtract:
             top_faces.append(torch.from_numpy(np.clip(top, 0.0, 1.0).astype(np.float32)))
             bottom_faces.append(torch.from_numpy(np.clip(bottom, 0.0, 1.0).astype(np.float32)))
 
-            pbar.update(i + 1)
+            pbar.update(1)
 
         # Stack into batches
         left_batch = torch.stack(left_faces, dim=0)
@@ -989,6 +1023,7 @@ class EquirectangularToCubemapFlexible:
         face_order: str = "F,R,B,L,U,D",
         interpolation: str = "lanczos",
     ) -> Tuple[Any]:
+        _validate_image(image)
         batch_size = int(image.shape[0])
         pbar = ProgressBar(batch_size)
 
@@ -1024,7 +1059,7 @@ class EquirectangularToCubemapFlexible:
             else:
                 raise ValueError(f"Unknown cube_format: {cube_format}")
 
-            pbar.update(i + 1)
+            pbar.update(1)
 
         if cube_format in ("stack", "list", "dict"):
             stacked = np.stack(stacked_faces, axis=0).astype(np.float32)
@@ -1113,6 +1148,7 @@ class CubemapToEquirectangularFlexible:
         output_height: int = 1024,
         interpolation: str = "lanczos",
     ) -> Tuple[torch.Tensor]:
+        _validate_image(cubemap)
         order: Optional[List[str]] = None
         if cube_format in ("horizon", "stack", "list", "dict"):
             order = _parse_face_order(face_order)
@@ -1152,7 +1188,7 @@ class CubemapToEquirectangularFlexible:
                 )
                 equi = np.clip(equi, 0.0, 1.0).astype(np.float32)
                 processed_images.append(torch.from_numpy(equi))
-                pbar.update(pano_idx + 1)
+                pbar.update(1)
 
             return (torch.stack(processed_images, dim=0),)
 
@@ -1168,6 +1204,8 @@ class CubemapToEquirectangularFlexible:
                 atlas = cube_np
             elif cube_format == "dice":
                 face_size = cube_np.shape[0] // 3
+                if cube_np.shape[:2] != (3 * face_size, 4 * face_size):
+                    raise ValueError("Dice layout must be 4x3 square faces")
                 faces = _faces_from_dice(cube_np, face_size)
                 atlas = _atlas_3x2_from_faces(faces)
             elif cube_format == "horizon":
@@ -1186,7 +1224,7 @@ class CubemapToEquirectangularFlexible:
             )
             equi = np.clip(equi, 0.0, 1.0).astype(np.float32)
             processed_images.append(torch.from_numpy(equi))
-            pbar.update(i + 1)
+            pbar.update(1)
 
         return (torch.stack(processed_images, dim=0),)
 
@@ -1234,6 +1272,12 @@ class StackCubemapFacesNode:
         Down: torch.Tensor,
         face_order: str = "F,R,B,L,U,D",
     ) -> Tuple[torch.Tensor]:
+        _validate_image(Back)
+        _validate_image(Down)
+        _validate_image(Front)
+        _validate_image(Left)
+        _validate_image(Right)
+        _validate_image(Up)
         order = _parse_face_order(face_order)
         faces = {
             "front": Front,
@@ -1294,6 +1338,7 @@ class SplitCubemapFacesNode:
     def split_faces(
         self, face_stack: torch.Tensor, face_order: str = "F,R,B,L,U,D"
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _validate_image(face_stack)
         order = _parse_face_order(face_order)
         total_faces = int(face_stack.shape[0])
         if total_faces % 6 != 0:
@@ -1461,6 +1506,7 @@ class LatLongCreateSeamMask:
         feather: int = 0,
         roll_x_by_50_percent: bool = False,
     ) -> Tuple[torch.Tensor]:
+        _validate_image(image)
         if image.dim() != 4:
             raise ValueError(f"Expected IMAGE (B,H,W,C), got shape {tuple(image.shape)}")
         mask = _create_center_seam_mask(
@@ -1548,6 +1594,7 @@ class LatLongCreatePoleMask:
         mode: str = "face",
         face_size: int = 512,
     ) -> Tuple[torch.Tensor]:
+        _validate_image(image)
         if image.dim() != 4:
             raise ValueError(f"Expected IMAGE (B,H,W,C), got shape {tuple(image.shape)}")
 
@@ -1584,7 +1631,7 @@ class LatLongCreatePoleMask:
             interpolation="bilinear",
         )
         pole_mask = np.clip(pole_mask[..., 0], 0.0, 1.0).astype(np.float32)
-        mask_t = torch.from_numpy(pole_mask).to(dtype=image.dtype)
+        mask_t = torch.from_numpy(pole_mask).to(dtype=image.dtype, device=image.device)
         return (mask_t.unsqueeze(0).repeat(b, 1, 1),)
 
 
@@ -1624,6 +1671,7 @@ class LatLongRollImage:
     def roll(
         self, image: torch.Tensor, roll_x: int = 0, roll_y: int = 0, roll_x_by_50_percent: bool = False
     ) -> Tuple[torch.Tensor]:
+        _validate_image(image)
         if roll_x_by_50_percent:
             roll_x = int(image.shape[2]) // 2
             roll_y = 0
@@ -1677,35 +1725,36 @@ class LatLongRollMask:
 def _conv_forward_circular_x(
     self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
-    x = torch.nn.functional.pad(x, self.padding_values_x, mode="circular")
-    x = torch.nn.functional.pad(x, self.padding_values_y, mode="constant")
+    left, right, top, bottom = self._reversed_padding_repeated_twice
+    x = torch.nn.functional.pad(x, (left, right, 0, 0), mode="circular")
+    x = torch.nn.functional.pad(x, (0, 0, top, bottom), mode="constant")
     return torch.nn.functional.conv2d(
         x, weight, bias, self.stride, (0, 0), self.dilation, self.groups
     )
+
+
+def _conv_forward_circular_xy(self, x, weight, bias):
+    x = torch.nn.functional.pad(x, self._reversed_padding_repeated_twice, mode="circular")
+    return torch.nn.functional.conv2d(x, weight, bias, self.stride, (0, 0), self.dilation, self.groups)
+
+
+def _add_padding_patches(patcher, x_axis_only):
+    forward = _conv_forward_circular_x if x_axis_only else _conv_forward_circular_xy
+    for name, layer in patcher.model.named_modules():
+        if isinstance(layer, torch.nn.Conv2d):
+            path = f"{name}._conv_forward" if name else "_conv_forward"
+            patcher.add_object_patch(path, forward.__get__(layer, type(layer)))
+    return patcher
 
 
 def _apply_circular_conv2d_padding(
     model: torch.nn.Module, is_vae: bool = False, x_axis_only: bool = True
 ) -> torch.nn.Module:
     modules = model.first_stage_model.modules() if is_vae else model.modules()
+    forward = _conv_forward_circular_x if x_axis_only else _conv_forward_circular_xy
     for layer in modules:
         if isinstance(layer, torch.nn.Conv2d):
-            if x_axis_only:
-                layer.padding_values_x = (
-                    layer._reversed_padding_repeated_twice[0],
-                    layer._reversed_padding_repeated_twice[1],
-                    0,
-                    0,
-                )
-                layer.padding_values_y = (
-                    0,
-                    0,
-                    layer._reversed_padding_repeated_twice[2],
-                    layer._reversed_padding_repeated_twice[3],
-                )
-                layer._conv_forward = _conv_forward_circular_x.__get__(layer, torch.nn.Conv2d)
-            else:
-                layer.padding_mode = "circular"
+            layer._conv_forward = forward.__get__(layer, type(layer))
     return model
 
 
@@ -1747,8 +1796,8 @@ class LatLongApplyCircularConvPaddingModel:
     def run(
         self, model: torch.nn.Module, inplace: bool = True, x_axis_only: bool = True
     ) -> Tuple[torch.nn.Module]:
-        use_model = model if inplace else copy.deepcopy(model)
-        _apply_circular_conv2d_padding(use_model.model, is_vae=False, x_axis_only=x_axis_only)
+        use_model = model if inplace else model.clone()
+        _add_padding_patches(use_model, x_axis_only)
         return (use_model,)
 
 
@@ -1790,8 +1839,10 @@ class LatLongApplyCircularConvPaddingVAE:
     def run(
         self, vae: torch.nn.Module, inplace: bool = True, x_axis_only: bool = True
     ) -> Tuple[torch.nn.Module]:
-        use_vae = vae if inplace else copy.deepcopy(vae)
-        _apply_circular_conv2d_padding(use_vae, is_vae=True, x_axis_only=x_axis_only)
+        use_vae = vae if inplace else copy.copy(vae)
+        if not inplace:
+            use_vae.patcher = vae.patcher.clone()
+        _add_padding_patches(use_vae.patcher, x_axis_only)
         return (use_vae,)
 
 
@@ -1853,6 +1904,7 @@ class PanoramaViewerNode:
     def view_pano(
         self, images: torch.Tensor, max_width: int = 4096
     ) -> Dict[str, Dict[str, str]]:
+        _validate_image(images)
         """Process and display the panoramic image in the viewer.
 
         This method handles the conversion of the input tensor to a viewable format by:
@@ -1885,11 +1937,11 @@ class PanoramaViewerNode:
 
         # Convert to uint8 if needed
         if image_np.dtype != np.uint8:
-            image_np = (image_np * 255).astype(np.uint8)
+            image_np = (np.clip(image_np, 0, 1) * 255).astype(np.uint8)
 
         # Handle grayscale images
         if len(image_np.shape) == 2 or image_np.shape[2] == 1:
-            image_np = np.repeat(image_np[..., np.newaxis], 3, axis=2)
+            image_np = np.repeat(image_np[..., None] if image_np.ndim == 2 else image_np, 3, axis=2)
 
         # Convert to PIL Image
         pil_image = Image.fromarray(image_np)
@@ -1909,7 +1961,7 @@ class PanoramaViewerNode:
 
         # Get base64 string
         img_str = base64.b64encode(buffered.getvalue()).decode()
-        return {"ui": {"pano_image": f"data:image/png;base64,{img_str}"}}
+        return {"ui": {"pano_image": [f"data:image/png;base64,{img_str}"]}}
 
 
 class PanoramaVideoViewerNode:
@@ -1982,89 +2034,11 @@ class PanoramaVideoViewerNode:
     def view_video_pano(
         self, video_frames: torch.Tensor, fps: int = 30, max_width: int = 2048
     ) -> Dict[str, Dict[str, str]]:
-        """Process and display the panoramic video in the viewer.
-
-        This method handles the conversion of the input tensor frames to a viewable video format by:
-        1. Processing each frame in the batch
-        2. Converting each tensor to a numpy array
-        3. Converting float values to uint8 if necessary
-        4. Converting grayscale to RGB if necessary
-        5. Resizing the frames if they exceed max_width
-        6. Creating a base64-encoded video from the frames
-
-        Args:
-            video_frames (torch.Tensor): Input tensor containing the panoramic video frames.
-                Should be in format (B, H, W, C).
-            fps (int, optional): Frames per second for video playback. Default: 30
-            max_width (int, optional): Maximum width for resizing. Frames will not be
-                resized if they are smaller than the specified size. Set to -1 to
-                disable resizing. Default: 2048
-
-        Returns:
-            Dict[str, Dict[str, str]]: Dictionary containing the UI update information
-                with the base64-encoded video data and playback parameters.
-        """
-        # Ensure we have batch dimension
-        if len(video_frames.shape) != 4:
-            raise ValueError("Expected video frames in batch format (B, H, W, C)")
-
-        # Create a list to store processed frames
-        processed_frames = []
-
-        # Process each frame
-        for frame in video_frames:
-            # Convert to numpy and proper format
-            frame_np = frame.cpu().numpy()
-
-            # Convert to uint8 if needed
-            if frame_np.dtype != np.uint8:
-                frame_np = (frame_np * 255).astype(np.uint8)
-
-            # Handle grayscale images
-            if len(frame_np.shape) == 2 or frame_np.shape[2] == 1:
-                frame_np = np.repeat(frame_np[..., np.newaxis], 3, axis=2)
-
-            # Convert to PIL Image
-            pil_frame = Image.fromarray(frame_np)
-
-            # Optionally resize image
-            if max_width > 0 and (
-                pil_frame.size[0] > max_width or pil_frame.size[1] > max_width
-            ):
-                new_size = tuple(
-                    [int(max_width * x / max(pil_frame.size)) for x in pil_frame.size]
-                )
-                pil_frame = pil_frame.resize(
-                    new_size, resample=Image.Resampling.LANCZOS
-                )
-
-            # Add to processed frames
-            processed_frames.append(pil_frame)
-
-        # Check if we have any frames
-        if not processed_frames:
-            return {"ui": {"error": "No frames found in input"}}
-
-        # Create a list to store base64 strings of each frame
-        frame_data = []
-
-        # Convert each frame to base64
-        for frame in processed_frames:
-            buffered = BytesIO()
-            frame.save(buffered, format="PNG")
-            img_str = base64.b64encode(buffered.getvalue()).decode()
-            frame_data.append(f"data:image/png;base64,{img_str}")
-
-        # Return the frame data, count, and fps
-        return {
-            "ui": {
-                "pano_video_preview": frame_data[0],  # First frame as preview
-                "pano_video_frames": frame_data,  # All frames as list of strings
-                "frame_count": str(len(processed_frames)),
-                "fps": str(fps),
-                "video_type": "360_equirectangular",
-            }
-        }
+        _validate_image(video_frames)
+        viewer = PanoramaViewerNode()
+        frame_data = [viewer.view_pano(frame[None], max_width)["ui"]["pano_image"][0] for frame in video_frames]
+        return {"ui": {"pano_video_preview": [frame_data[0]], "pano_video_frames": frame_data,
+                       "frame_count": [str(len(frame_data))], "fps": [str(fps)], "video_type": ["360_equirectangular"]}}
 
 
 class EquirectangularEdgeBlender:
@@ -2112,6 +2086,7 @@ class EquirectangularEdgeBlender:
                    blend_mode: str = "cosine",
                    check_continuity: bool = True) -> Tuple[torch.Tensor]:
 
+        _validate_image(image)
         if blend_width == 0:
             print("⚠️ blend_width=0, skipping edge blending")
             return (image,)
@@ -2154,7 +2129,7 @@ class EquirectangularEdgeBlender:
             blended_tensor = torch.from_numpy(blended_img)
             processed_images.append(blended_tensor)
 
-            pbar.update(i + 1)
+            pbar.update(1)
 
         result = torch.stack(processed_images, dim=0)
         return (result,)
@@ -2168,15 +2143,15 @@ def _create_inner_feather_mask(width: int, height: int, feather: int) -> torch.T
     # Create coordinate grids
     y = torch.arange(height, dtype=torch.float32)
     x = torch.arange(width, dtype=torch.float32)
-    
+
     # Distance from nearest edge
     dist_x = torch.min(x, width - 1 - x)
     dist_y = torch.min(y, height - 1 - y)
-    
+
     # Feather falloff
     mask_x = torch.clamp(dist_x / max(1, feather), 0, 1) if feather > 0 else (dist_x >= 0).float()
     mask_y = torch.clamp(dist_y / max(1, feather), 0, 1) if feather > 0 else (dist_y >= 0).float()
-    
+
     # Combine (H, W)
     mask = mask_y.unsqueeze(1) * mask_x.unsqueeze(0)
     return mask
@@ -2191,42 +2166,44 @@ def _perspective_insert(
     """
     Project a flat image onto an equirectangular canvas.
     Inverse of perspective_extract.
-    
+
     Args:
         flat_image: (C, H_src, W_src)
         canvas_h, canvas_w: Output dimensions
         yaw, pitch, roll: Camera rotation (degrees)
         fov_deg: Horizontal Field of View of the flat image
         feather: Inner feather pixels (relative to flat image source coords)
-        
+
     Returns:
         (canvas_image (C,H,W), mask (1,H,W))
     """
+    if not all(math.isfinite(v) for v in (yaw, pitch, roll, fov_deg)) or not 0 < fov_deg < 180:
+        raise ValueError("Projection angles must be finite and FOV must be between 0 and 180 degrees")
     device = flat_image.device
     C, H_src, W_src = flat_image.shape
-    
+
     # 1. Create grid for Canvas (Equirectangular)
     ys = torch.linspace(0, canvas_h - 1, canvas_h, device=device)
     xs = torch.linspace(0, canvas_w - 1, canvas_w, device=device)
     yg, xg = torch.meshgrid(ys, xs, indexing='ij') # (H, W)
-    
+
     # Equirect -> Spherical (lat, lon)
     lon = (xg / canvas_w) * (2 * math.pi) - math.pi
     lat = (math.pi / 2) - (yg / canvas_h) * math.pi
-    
+
     # Spherical -> Cartesian (world direction vectors)
     # Convention: +X = lon 0 (front), +Y = lon 90 (right), +Z = lat 90 (up/north pole)
     cos_lat = torch.cos(lat)
     x_world = cos_lat * torch.cos(lon)
     y_world = cos_lat * torch.sin(lon)
     z_world = torch.sin(lat)
-    
+
     # Stack to (H, W, 3)
     xyz_world = torch.stack([x_world, y_world, z_world], dim=-1)
-    
+
     # 2. Rotate World -> Camera (Inverse Rotation)
     # First apply user rotation, then we'll reinterpret axes so camera looks at equator by default.
-    # 
+    #
     # The user's yaw/pitch should match intuitive behavior:
     # - yaw=0, pitch=0: look at center/equator (world +X)
     # - yaw rotates horizontally, pitch rotates vertically
@@ -2237,68 +2214,68 @@ def _perspective_insert(
     #
     # After applying user rotation R to world points, we remap axes:
     # cam_x = world_y, cam_y = -world_z, cam_z = world_x
-    
+
     R = EquirectangularProcessor._torch_rotation_matrix(yaw, pitch, roll, device, torch.float32)
     # xyz_cam = xyz_world @ R (since R maps Cam->World, R.T maps World->Cam)
     xyz_rotated = torch.tensordot(xyz_world, R, dims=1)  # (H, W, 3)
-    
+
     # Remap axes so camera looks at equator (+X) by default
     # cam_z = world_x (look direction), cam_x = world_y (right), cam_y = -world_z (down)
     x_c = xyz_rotated[..., 1]   # world_y -> cam_x
     y_c = -xyz_rotated[..., 2]  # -world_z -> cam_y (down direction)
     z_c = xyz_rotated[..., 0]   # world_x -> cam_z (look direction)
-    
+
     # 3. Project Camera -> Flat Image Plane
-    # Canonical camera looks usually down +Z or +X. 
+    # Canonical camera looks usually down +Z or +X.
     # In processor.perspective_extract:
     # x_cam = (u - cx) / f
     # y_cam = (v - cy) / f
     # z_cam = 1
     # This implies camera looks down +Z.
-    
+
     # We need to filter points behind the camera
     valid_mask = z_c > 0
-    
+
     # Perspective projection
     # u_norm = x_c / z_c, v_norm = y_c / z_c
     # y_c already accounts for down direction from axis remapping
     z_c = torch.clamp(z_c, min=1e-6)
     u_norm = x_c / z_c
     v_norm = y_c / z_c
-    
+
     # 4. Convert to Pixel Coords
     # f = W / (2 * tan(fov/2))
     # We can normalize coordinates to [-1, 1] range first to use grid_sample
-    
+
     # f_norm (relative to width/2) = 1.0 / tan(fov/2)
     tan_half_fov = math.tan(math.radians(fov_deg) / 2.0)
-    
+
     # For canonical grid [-1, 1]:
-    # x = u_norm * (f contribution). 
+    # x = u_norm * (f contribution).
     # Let's map directly to grid coords [-1, 1] for grid_sample.
     # Horizontal: -1 is left edge, +1 is right edge of flat image.
     # Ray at edge: x/z = tan(fov/2)
     # So grid_x = (x/z) / tan(fov/2)
     grid_x = u_norm / tan_half_fov
-    
+
     # Vertical: assume square pixels, so scale by aspect ratio
     aspect = W_src / H_src
     # grid_y = (y/z) / (tan(fov/2) / aspect)
     grid_y = v_norm / (tan_half_fov / aspect)
-    
+
     # Update valid mask to only include points within the flat image
     valid_mask = valid_mask & (grid_x >= -1.0) & (grid_x <= 1.0) & (grid_y >= -1.0) & (grid_y <= 1.0)
-    
+
     # 5. Sample from Flat Image using grid_sample
     # grid needs to be (N, H_out, W_out, 2)
     grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0) # (1, H, W, 2)
-    
+
     # Input image needs to be (N, C, H, W)
     img_batch = flat_image.unsqueeze(0)
-    
-    sampled = torch.nn.functional.grid_sample(img_batch, grid, align_corners=True, padding_mode="zeros")
+
+    sampled = torch.nn.functional.grid_sample(img_batch, grid, align_corners=False, padding_mode="border")
     sampled = sampled.squeeze(0) # (C, H, W)
-    
+
     # 6. Apply Feathering
     # We can compute feather in grid space
     if feather > 0:
@@ -2306,20 +2283,20 @@ def _perspective_insert(
         # Convert grid [-1, 1] to [0, W]
         # dist_left = (grid_x - (-1)) -> ranges 0..2
         # pixel_dist = (grid_x + 1)/2 * W
-        
+
         # Simpler: feather in normalized device coordinates (NDC)
         # NDC width = 2.0. Pixel width = W.
         # feather_ndc_x = feather / W * 2.0
         feather_ndc_x = (feather / W_src) * 2.0
         feather_ndc_y = (feather / H_src) * 2.0
-        
+
         # Dist from nearest edge in NDC
         dist_x = 1.0 - torch.abs(grid_x)
         dist_y = 1.0 - torch.abs(grid_y)
-        
+
         alpha_x = torch.clamp(dist_x / max(1e-6, feather_ndc_x), 0, 1)
         alpha_y = torch.clamp(dist_y / max(1e-6, feather_ndc_y), 0, 1)
-        
+
         feather_mask = alpha_x * alpha_y
         valid_mask = valid_mask & (feather_mask > 0)
         # We'll multiply the mask later
@@ -2329,16 +2306,47 @@ def _perspective_insert(
     # 7. Compose Final Mask
     # valid_mask is boolean (H, W).
     final_mask = valid_mask.float() * feather_mask
-    
+
     # Zero out invalid areas in sampled image
     sampled = sampled * valid_mask.float().unsqueeze(0)
-    
+
     return sampled, final_mask.unsqueeze(0) # (C,H,W), (1,H,W)
+
+
+def _outpaint_layer(source, context, height, width):
+    source = source.permute(2, 0, 1).float()
+    c, sh, sw = source.shape
+    scale = context["scale"]
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("Scale must be finite and positive")
+    if context["placement_mode"] == "perspective":
+        fov = math.degrees(2 * math.atan(math.tan(math.radians(context["fov"]) / 2) * scale))
+        return _perspective_insert(source, height, width, context["yaw"], context["pitch"], 0, fov, context["feather_size"])
+    sx = width / context["setup_canvas_width"]
+    sy = height / context["setup_canvas_height"]
+    target_w, target_h = max(1, round(sw * scale * sx)), max(1, round(sh * scale * sy))
+    left = width // 2 - target_w // 2 + round(context["translate_x"] * sx)
+    top = height // 2 - target_h // 2 + round(context["translate_y"] * sy)
+    # Sample only the destination canvas; even very large scales need no giant resized source.
+    yy, xx = torch.meshgrid(torch.arange(height, device=source.device), torch.arange(width, device=source.device), indexing="ij")
+    local_x = torch.remainder(xx - left, width).float()
+    local_y = (yy - top).float()
+    valid = (local_x < target_w) & (local_y >= 0) & (local_y < target_h)
+    grid = torch.stack((2 * (local_x + .5) / target_w - 1, 2 * (local_y + .5) / target_h - 1), -1)[None]
+    layer = torch.nn.functional.grid_sample(source[None], grid, align_corners=False, padding_mode="border")[0]
+    feather = context["feather_size"]
+    if feather:
+        ax = (torch.minimum(local_x, target_w - 1 - local_x) / max(1, feather * sx)).clamp(0, 1)
+        ay = (torch.minimum(local_y, target_h - 1 - local_y) / max(1, feather * sy)).clamp(0, 1)
+        alpha = valid.float() * ax * ay
+    else:
+        alpha = valid.float()
+    return layer * valid[None], alpha[None]
 
 
 class LatLongOutpaintSetup:
     """Setup node for LatLong outpainting workflow."""
-    
+
     DESCRIPTION = "Place a flat image onto a transparent equirectangular canvas for outpainting."
     CATEGORY = "LatLong/Outpaint"
     RETURN_TYPES = ("IMAGE", "MASK", "STITCH_CONTEXT")
@@ -2366,152 +2374,24 @@ class LatLongOutpaintSetup:
 
     def setup(self, flat_image, canvas_width, canvas_height, force_2by1_aspect, placement_mode, scale, translate_x, translate_y, yaw, pitch, fov, feather_size):
         # Apply 2:1 aspect ratio constraint if enabled
+        _validate_image(flat_image)
         if force_2by1_aspect:
             canvas_height = canvas_width // 2
-        
-        N, H, W, C = flat_image.shape
-        device = flat_image.device
-        
-        # Prepare batch outputs
-        out_images = []
-        out_masks = []
-        
-        # Store context (assuming N=1 for context simplicity, or list of contexts)
-        # We'll store standard python objects
-        context = {
-            "placement_mode": placement_mode,
-            "original_image": flat_image, # Keep tensor on device
-            "scale": scale,
-            "translate_x": translate_x,
-            "translate_y": translate_y,
-            "yaw": yaw,
-            "pitch": pitch,
-            "fov": fov,
-            "feather_size": feather_size,
-            "setup_canvas_width": canvas_width,
-            "setup_canvas_height": canvas_height
-        }
-        
-        for i in range(N):
-            img = flat_image[i].permute(2, 0, 1) # (C, H, W)
-            
-            if placement_mode == "2d_composite":
-                # Create empty canvas
-                canvas = torch.zeros((C, canvas_height, canvas_width), device=device, dtype=torch.float32)
-                alpha = torch.zeros((1, canvas_height, canvas_width), device=device, dtype=torch.float32)
-                
-                # Calculate scaled dimensions
-                new_w = int(W * scale)
-                new_h = int(H * scale)
-                
-                if new_w > 0 and new_h > 0:
-                    # Resize source
-                    # Add batch dim for interpolate
-                    img_batch = img.unsqueeze(0)
-                    scaled_img = torch.nn.functional.interpolate(img_batch, size=(new_h, new_w), mode='bilinear', align_corners=False).squeeze(0)
-                    
-                    # Create mask with feather
-                    mask_small = _create_inner_feather_mask(new_w, new_h, feather_size).to(device)
-                    
-                    # Calculate placement
-                    # Center
-                    cx = canvas_width // 2
-                    cy = canvas_height // 2
-                    
-                    # Top-left w.r.t center, plus offset
-                    tl_x = cx - (new_w // 2) + translate_x
-                    tl_y = cy - (new_h // 2) + translate_y
-                    
-                    # Clip to canvas bounds
-                    x_start = max(0, tl_x)
-                    y_start = max(0, tl_y)
-                    x_end = min(canvas_width, tl_x + new_w)
-                    y_end = min(canvas_height, tl_y + new_h)
-                    
-                    # Source offsets
-                    src_x = x_start - tl_x
-                    src_y = y_start - tl_y
-                    w_slice = x_end - x_start
-                    h_slice = y_end - y_start
-                    
-                    if w_slice > 0 and h_slice > 0:
-                        # Composite
-                        # We use simple copy for 2D composite on empty canvas
-                        # But handle feather alpha
-                        canvas[:, y_start:y_end, x_start:x_end] = scaled_img[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
-                        alpha[:, y_start:y_end, x_start:x_end] = mask_small[src_y:src_y+h_slice, src_x:src_x+w_slice].unsqueeze(0)
-                
-                # For output, we want RGB + Alpha channel if possible?
-                # User asked for "transparent canvas". ComfyUI IMAGE is usually RGB.
-                # But creating a MASK output allows standard inpainting.
-                # However, if we return IMAGE with alpha, some nodes handle it.
-                # We'll return RGB (premultiplied or masked?) and explicit MASK.
-                # MASK: 1 = masked (keep), 0 = unmasked (inpaint).
-                # Actually, standard Inpainting masks: 1 = inpaint this, 0 = keep this.
-                # "transparent canvas" -> we want to inpaint the Transparent parts.
-                # So Mask = 1 where Alpha = 0. Mask = 0 where Alpha = 1.
-                # "alpha feather feather controls on the add flat image"
-                # If we feather the image, the semi-transparent parts should be partially inpainted?
-                # Usually: Mask = 1 - Alpha.
-                
-                out_img = canvas.permute(1, 2, 0) # BHWC
-                out_mask = (1.0 - alpha).squeeze(0) # BHW
-                
-            else: # perspective
-                # Perspective projection with proper scale behavior:
-                # 
-                # The `fov` parameter controls the projection distortion (how "wide" the lens is).
-                # The `scale` parameter controls the projected image SIZE on the canvas.
-                #
-                # To scale the size WITHOUT increasing distortion, we scale the source image
-                # dimensions and keep FOV constant. A larger source image projected at the
-                # same FOV will cover more of the panorama.
-                
-                # Scale the source image first if scale != 1
-                if abs(scale - 1.0) > 0.001:
-                    scaled_h = int(H * scale)
-                    scaled_w = int(W * scale)
-                    if scaled_h > 0 and scaled_w > 0:
-                        img_batch = img.unsqueeze(0)
-                        img_scaled = torch.nn.functional.interpolate(
-                            img_batch, size=(scaled_h, scaled_w), 
-                            mode='bilinear', align_corners=False
-                        ).squeeze(0)
-                    else:
-                        img_scaled = img
-                else:
-                    img_scaled = img
-                
-                # Use fov directly (no scaling) - controls distortion
-                eff_fov = max(5.0, min(150.0, fov))
-                
-                # Scale feather proportionally
-                scaled_feather = int(feather_size * scale) if scale > 1.0 else feather_size
-                
-                # Project
-                proj_img, proj_mask = _perspective_insert(
-                    img_scaled, 
-                    canvas_height, canvas_width,
-                    yaw, pitch, 0.0, # roll not exposed/default 0
-                    eff_fov,
-                    feather=scaled_feather
-                )
-                
-                out_img = proj_img.permute(1, 2, 0)
-                out_mask = (1.0 - proj_mask).squeeze(0)
-            
-            out_images.append(out_img)
-            out_masks.append(out_mask)
-            
-        final_images = torch.stack(out_images)
-        final_masks = torch.stack(out_masks)
-        
-        return (final_images, final_masks, context)
+        context = dict(version=1, placement_mode=placement_mode, original_image=flat_image,
+                       scale=scale, translate_x=translate_x, translate_y=translate_y,
+                       yaw=yaw, pitch=pitch, fov=fov, feather_size=feather_size,
+                       setup_canvas_width=canvas_width, setup_canvas_height=canvas_height)
+        layers, masks = [], []
+        for source in flat_image:
+            layer, alpha = _outpaint_layer(source, context, canvas_height, canvas_width)
+            layers.append(layer.permute(1, 2, 0))
+            masks.append(1 - alpha[0])
+        return torch.stack(layers), torch.stack(masks), context
 
 
 class LatLongOutpaintStitch:
     """Stitch high-res source back over generated equirectangular result."""
-    
+
     DESCRIPTION = "Composite the original high-res source back over the generated result."
     CATEGORY = "LatLong/Outpaint"
     RETURN_TYPES = ("IMAGE",)
@@ -2530,162 +2410,20 @@ class LatLongOutpaintStitch:
 
     def stitch(self, generated_equirect, stitch_context, blend_mode):
         # Unpack context
-        ctx = stitch_context
-        orig_flat = ctx["original_image"] # (N, H, W, C)
-        mode = ctx["placement_mode"]
-        scale = ctx["scale"]
-        tx = ctx["translate_x"]
-        ty = ctx["translate_y"]
-        yaw = ctx["yaw"]
-        pitch = ctx["pitch"]
-        fov = ctx["fov"]
-        feather = ctx["feather_size"]
-        setup_w = ctx["setup_canvas_width"]
-        setup_h = ctx["setup_canvas_height"]
-        
-        N, H_gen, W_gen, C_gen = generated_equirect.shape
-        device = generated_equirect.device
-        
-        # Debug info
-        print(f"[Stitch Debug] Generated equirect shape: {generated_equirect.shape}")
-        print(f"[Stitch Debug] Original flat shape: {orig_flat.shape}")
-        print(f"[Stitch Debug] Setup canvas: {setup_w}x{setup_h}")
-        print(f"[Stitch Debug] Mode: {mode}, Scale: {scale}, Feather: {feather}")
-        
-        # Determine scale factor between setup canvas and generation
-        # (e.g. if user upscaled the latent)
-        res_scale = W_gen / float(setup_w)
-        
-        # We need to re-generate the composite layer at the NEW resolution
-        # using the ORIGINAL high-res image.
-        
-        # Assume batch size 1 for context logic reuse, or match N
-        # If N > 1, apply same context to all? Yes.
-        
-        final_images = []
-        
-        for i in range(N):
-            gen_img = generated_equirect[i].permute(2, 0, 1) # (C, H, W)
-            orig_src = orig_flat[i % len(orig_flat)].permute(2, 0, 1) # Loop if batches mismatch
-            
-            src_c, src_h, src_w = orig_src.shape
-            
-            if mode == "2d_composite":
-                # Create empty canvas at CURRENT gen resolution
-                canvas = torch.zeros_like(gen_img)
-                alpha = torch.zeros((1, H_gen, W_gen), device=device)
-                
-                # Scale params by res_scale
-                # scale param in 2d is pixel multiplier relative to source.
-                # Wait, in Setup: "new_w = int(W * scale)".
-                # The 'scale' param is relative to the SOURCE image pixels.
-                # If we want to maintain the same relative size on the NEW canvas:
-                # The "size on canvas" in Setup was (W * scale).
-                # The "size on canvas" in Stitch should be (W * scale) * res_scale.
-                
-                # Wait, proper logic:
-                # We want the flat image to occupy the same PROPORTION of the canvas.
-                # Setup: occupied (W*scale) / setup_w fraction.
-                # Stitch: should occupy (W_new) / W_gen fraction.
-                # So W_new / W_gen = (W*scale) / setup_w
-                # => W_new = (W*scale) * (W_gen / setup_w) = (W*scale) * res_scale.
-                
-                target_w = int(src_w * scale * res_scale)
-                target_h = int(src_h * scale * res_scale)
-                
-                # Scaled feather
-                target_feather = int(feather * res_scale)
-                
-                print(f"[Stitch Debug] 2D: target_w={target_w}, target_h={target_h}, target_feather={target_feather}, res_scale={res_scale}")
-                
-                if target_w > 0 and target_h > 0:
-                     # Resize high-res source to target size
-                     src_batch = orig_src.unsqueeze(0)
-                     scaled_src = torch.nn.functional.interpolate(src_batch, size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(0)
-                     
-                     mask_small = _create_inner_feather_mask(target_w, target_h, target_feather).to(device)
-                     
-                     print(f"[Stitch Debug] 2D: mask_small shape={mask_small.shape}, min={mask_small.min():.3f}, max={mask_small.max():.3f}")
-                     
-                     # Calculate placement
-                     cx = W_gen // 2
-                     cy = H_gen // 2
-                     
-                     # Scaled offsets
-                     eff_Tx = int(tx * res_scale)
-                     eff_Ty = int(ty * res_scale)
-                     
-                     tl_x = cx - (target_w // 2) + eff_Tx
-                     tl_y = cy - (target_h // 2) + eff_Ty
-                     
-                     # Clip
-                     x_start = max(0, tl_x)
-                     y_start = max(0, tl_y)
-                     x_end = min(W_gen, tl_x + target_w)
-                     y_end = min(H_gen, tl_y + target_h)
-                     
-                     src_x = x_start - tl_x
-                     src_y = y_start - tl_y
-                     w_slice = x_end - x_start
-                     h_slice = y_end - y_start
-                     
-                     print(f"[Stitch Debug] 2D: placement x={x_start}:{x_end}, y={y_start}:{y_end}, w_slice={w_slice}, h_slice={h_slice}")
-                     
-                     if w_slice > 0 and h_slice > 0:
-                         canvas[:, y_start:y_end, x_start:x_end] = scaled_src[:, src_y:src_y+h_slice, src_x:src_x+w_slice]
-                         alpha[:, y_start:y_end, x_start:x_end] = mask_small[src_y:src_y+h_slice, src_x:src_x+w_slice].unsqueeze(0)
-                         print(f"[Stitch Debug] 2D: alpha after placement min={alpha.min():.3f}, max={alpha.max():.3f}, sum={alpha.sum():.0f}")
-                     else:
-                         print("[Stitch Debug] 2D: w_slice or h_slice is 0, no placement")
-                else:
-                     print("[Stitch Debug] 2D: target_w or target_h is 0, skipping")
-            else: # perspective
-                # Scale the source image to control size (same approach as Setup)
-                # This avoids distortion from increasing FOV
-                src_c, src_h, src_w = orig_src.shape
-                
-                if abs(scale - 1.0) > 0.001:
-                    scaled_h = int(src_h * scale)
-                    scaled_w = int(src_w * scale)
-                    if scaled_h > 0 and scaled_w > 0:
-                        src_batch = orig_src.unsqueeze(0)
-                        src_scaled = torch.nn.functional.interpolate(
-                            src_batch, size=(scaled_h, scaled_w),
-                            mode='bilinear', align_corners=False
-                        ).squeeze(0)
-                    else:
-                        src_scaled = orig_src
-                else:
-                    src_scaled = orig_src
-                
-                # Use fov directly - controls distortion
-                eff_fov = max(5.0, min(150.0, fov))
-                
-                # Scale feather proportionally
-                scaled_feather = int(feather * scale) if scale > 1.0 else feather
-                
-                proj_img, proj_mask = _perspective_insert(
-                    src_scaled,
-                    H_gen, W_gen,
-                    yaw, pitch, 0.0,
-                    eff_fov,
-                    feather=scaled_feather
-                )
-                canvas = proj_img
-                alpha = proj_mask
-            
-            # Composite
-            # Result = Alpha * Source + (1 - Alpha) * Gen
-            # (Assuming alpha blend)
-            
-            # gen_img is (C, H, W)
-            # canvas is (C, H, W)
-            # alpha is (1, H, W)
-            
-            final = alpha * canvas + (1.0 - alpha) * gen_img
-            print(f"[Stitch Debug] Frame {i}: gen_img shape: {gen_img.shape}, canvas shape: {canvas.shape}, alpha shape: {alpha.shape}, final shape: {final.shape}")
-            final_images.append(final.permute(1, 2, 0)) # BHWC
-            
-        result = torch.stack(final_images)
-        print(f"[Stitch Debug] Final result shape: {result.shape}")
-        return (result,)
+        _validate_image(generated_equirect)
+        if stitch_context.get("version", 1) != 1:
+            raise ValueError("Unsupported stitch context version")
+        if blend_mode not in ("alpha", "overlay", "hard"):
+            raise ValueError("Unknown blend mode")
+        sources = stitch_context["original_image"]
+        results = []
+        for i, generated in enumerate(generated_equirect):
+            context = dict(stitch_context)
+            if blend_mode == "hard":
+                context["feather_size"] = 0
+            layer, alpha = _outpaint_layer(sources[i % len(sources)].to(generated.device), context, generated.shape[0], generated.shape[1])
+            base = generated.permute(2, 0, 1)
+            if blend_mode == "overlay":
+                layer = torch.where(base <= .5, 2 * base * layer, 1 - 2 * (1 - base) * (1 - layer))
+            results.append((alpha * layer + (1-alpha) * base).permute(1, 2, 0))
+        return (torch.stack(results),)
